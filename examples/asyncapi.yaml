@@ -1,0 +1,93 @@
+asyncapi: 3.0.0
+info:
+  title: Orders Events
+  version: 1.0.0
+  description: Event contracts for the orders domain.
+servers:
+  production:
+    host: kafka.example.com:9092
+    protocol: kafka
+channels:
+  orderCreated:
+    address: orders.created
+    description: Emitted when a new order is placed.
+    messages:
+      OrderCreated:
+        $ref: '#/components/messages/OrderCreated'
+  orderShipped:
+    address: orders.shipped
+    description: Emitted when an order is dispatched.
+    messages:
+      OrderShipped:
+        $ref: '#/components/messages/OrderShipped'
+operations:
+  onOrderCreated:
+    action: receive
+    channel:
+      $ref: '#/channels/orderCreated'
+  publishOrderShipped:
+    action: send
+    channel:
+      $ref: '#/channels/orderShipped'
+components:
+  messages:
+    OrderCreated:
+      name: OrderCreated
+      title: Order Created
+      summary: A customer placed an order.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/Order'
+    OrderShipped:
+      name: OrderShipped
+      title: Order Shipped
+      contentType: application/json
+      payload:
+        type: object
+        required:
+          - orderId
+          - trackingNumber
+        properties:
+          orderId:
+            type: string
+            example: ord_123
+          trackingNumber:
+            type: string
+            example: 1Z999
+          shippedAt:
+            type: string
+            format: date-time
+  schemas:
+    Order:
+      type: object
+      required:
+        - orderId
+        - customerId
+        - total
+      properties:
+        orderId:
+          type: string
+          example: ord_123
+        customerId:
+          type: string
+          example: cust_42
+        total:
+          type: number
+          example: 99.95
+        currency:
+          type: string
+          example: USD
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/LineItem'
+    LineItem:
+      type: object
+      required:
+        - sku
+        - quantity
+      properties:
+        sku:
+          type: string
+        quantity:
+          type: integer

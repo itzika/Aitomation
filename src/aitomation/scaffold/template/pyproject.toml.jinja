@@ -6,6 +6,14 @@ requires-python = ">=3.12"
 dependencies = [
     "pytest>=8",
     "pytest-playwright>=0.5",
+{% if has_db %}
+    "sqlalchemy>=2",
+    # Install the DBAPI driver for your database, e.g. "psycopg" (PostgreSQL) or
+    # "pymysql" (MySQL). SQLite needs none.
+{% endif %}
+{% if has_events %}
+    "jsonschema>=4",
+{% endif %}
 ]
 
 [tool.pytest.ini_options]

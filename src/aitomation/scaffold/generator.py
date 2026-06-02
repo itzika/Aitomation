@@ -135,6 +135,38 @@ def inventory_to_context(inv: CoverageInventory) -> dict[str, Any]:
         for e in inv.elements
         if e.kind == "endpoint"
     ]
+    # Backend surfaces: tables (DB), topics + event_schemas (message queues). These drive
+    # the optional db_inspector / message_schema fixtures and conditional scaffold deps.
+    tables = [
+        {
+            "name": e.name,
+            "location": e.location,
+            "description": e.description.replace('"', "'"),
+            "columns": [
+                {"name": i.name, "type": i.type, "required": i.required}
+                for i in e.inputs
+                if i.where == "column"
+            ],
+            "constraints": list(e.preconditions),
+        }
+        for e in inv.elements
+        if e.kind in ("table", "migration")
+    ]
+    topics = [
+        {"name": e.name, "location": e.location, "operations": e.method or ""}
+        for e in inv.elements
+        if e.kind == "topic"
+    ]
+    event_schemas = [
+        {
+            "name": e.name,
+            "location": e.location,
+            "fields": [{"name": i.name, "type": i.type, "required": i.required} for i in e.inputs],
+            "has_schema": e.json_schema is not None,
+        }
+        for e in inv.elements
+        if e.kind == "event_schema"
+    ]
     journeys = [
         {
             "name": j.name,
@@ -167,8 +199,13 @@ def inventory_to_context(inv: CoverageInventory) -> dict[str, Any]:
         "auth_in": auth["auth_in"],
         "has_browser": bool(pages),
         "has_api": bool(endpoints),
+        "has_db": bool(tables),
+        "has_events": bool(topics or event_schemas),
         "pages": pages,
         "endpoints": endpoints,
+        "tables": tables,
+        "topics": topics,
+        "event_schemas": event_schemas,
         "journeys": journeys,
         "smoke_path": smoke_path,
         "source": inv.source,
@@ -176,10 +213,23 @@ def inventory_to_context(inv: CoverageInventory) -> dict[str, Any]:
     }
 
 
+def _event_schemas_json(inv: CoverageInventory) -> dict[str, Any]:
+    """The discovered message payload JSON Schemas, keyed by element name. Emitted to
+    `schemas.json` so the `message_schema` fixture (and contract drafts) can validate against
+    the real schema without re-reading the source spec."""
+    return {
+        e.name: e.json_schema
+        for e in inv.elements
+        if e.kind == "event_schema" and e.json_schema is not None
+    }
+
+
 def scaffold_project(
     inventory: CoverageInventory, dest: Path | str, *, overwrite: bool = True
 ) -> Path:
     """Render the pytest+playwright scaffold for `inventory` into `dest`. Returns dest."""
+    import json
+
     from copier import run_copy
 
     dest = Path(dest)
@@ -194,4 +244,11 @@ def scaffold_project(
             overwrite=overwrite,
             quiet=True,
         )
+
+    # Event payload schemas are written post-copy as plain JSON (rather than rendered through
+    # Jinja) so nested schema objects can't collide with template delimiters. The
+    # message_schema fixture loads this file.
+    schemas = _event_schemas_json(inventory)
+    if schemas:
+        (dest / "schemas.json").write_text(json.dumps(schemas, indent=2), encoding="utf-8")
     return dest

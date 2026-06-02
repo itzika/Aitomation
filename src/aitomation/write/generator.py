@@ -108,6 +108,27 @@ _SUBMIT_VERBS = (
     "checkout", "subscribe", "log in", "login", "update", "delete", "post ",
 )
 
+# Markers of REAL mutation in *generated code* (not journey prose). Backend contract drafts are
+# read-only by construction — the prompt forbids DML/publishing and the scaffold provides only
+# read-only fixtures (db_inspector / message_schema) — but if a model ignores that and emits an
+# actual write or publish, we guard it. Code is a reliable signal; journey descriptions are not
+# (a contract check is routinely described as "rejects inserts" / "producers emit valid …").
+_DML_MARKERS = (
+    "insert into", "update ", "delete from", "drop table", "truncate", "create table",
+    ".commit(",  # explicit persist; the scaffold exposes only db_inspector/db_engine (no ORM session)
+)
+_PUBLISH_MARKERS = (
+    ".produce(", ".publish(", ".send(", "kafkaproducer", "confluent_kafka", "aiokafka", "pika.",
+)
+
+
+def _mutates_backend(code: str) -> bool:
+    """True if a generated DATA/EVENT draft actually performs a write/publish (vs. read-only
+    introspection or schema validation). The post-generation safety net behind is_destructive
+    for backend surfaces — see _DML_MARKERS / _PUBLISH_MARKERS."""
+    lowered = code.lower()
+    return any(m in lowered for m in _DML_MARKERS) or any(m in lowered for m in _PUBLISH_MARKERS)
+
 
 def is_destructive(inv: CoverageInventory, journey: Journey) -> bool:
     """True if the journey performs a destructive action. API endpoints with a mutating
@@ -131,6 +152,9 @@ def is_destructive(inv: CoverageInventory, journey: Journey) -> bool:
         mutating = (e.method or "").upper() in _MUTATING_METHODS
         if password or (mutating and submits):
             return True
+    # Note: EVENT/DATA (topic/table) journeys are NOT judged here — their contract drafts are
+    # read-only by construction. A draft that nonetheless emits real mutation is caught
+    # post-generation in draft_tests via _mutates_backend (code, not prose).
     return False
 
 
@@ -138,12 +162,12 @@ def is_destructive(inv: CoverageInventory, journey: Journey) -> bool:
 # Prompting
 # --------------------------------------------------------------------------------------
 
-def journey_type(*, web: bool, api: bool) -> str:
-    """The discriminator the user prompt states so the static system prompt's conditional
-    rules resolve. One of WEB+API / API-only / WEB-only."""
-    if web and api:
-        return "WEB+API"
-    return "API-only" if api else "WEB-only"
+def journey_type(*, web: bool, api: bool, event: bool = False, data: bool = False) -> str:
+    """The surface tags the user prompt declares so the system prompt's per-surface rules
+    resolve. Composable: a journey can touch several surfaces (e.g. 'API+EVENT'). One of
+    WEB / API / EVENT / DATA or a '+'-joined combination; defaults to API if none apply."""
+    tags = [t for t, on in (("WEB", web), ("API", api), ("EVENT", event), ("DATA", data)) if on]
+    return "+".join(tags) or "API"
 
 
 def build_system_prompt() -> str:
@@ -157,8 +181,9 @@ def build_system_prompt() -> str:
         "You are a senior test-automation engineer writing a FIRST-DRAFT pytest test for ONE journey",
         "through a system. A human will review it before it is trusted.",
         "",
-        "The context below declares a 'Journey type': one of WEB+API, API-only, or WEB-only. Apply the",
-        "type-specific rules for exactly that type and ignore the others.",
+        "The context below declares a 'Journey type' naming the surfaces this journey touches —",
+        "one or a combination of WEB, API, EVENT (message queues), DATA (databases), e.g. 'API+EVENT'.",
+        "Apply the rules for EACH surface named and ignore rules for surfaces not present.",
         "",
         "Hard rules (these encode a product guarantee — follow them exactly):",
         "- Output a COMPLETE, importable Python module: imports, a short module docstring naming the",
@@ -177,27 +202,45 @@ def build_system_prompt() -> str:
         "- Do NOT skip the test yourself — no `pytest.mark.skip`, `xfail`, or module-level `pytestmark`.",
         "  Write it to actually run; the toolkit injects skips for destructive flows on its own.",
         "",
-        "For WEB+API or WEB-only journeys:",
+        "For journeys that touch a WEB surface:",
         "- Use the generated Page Objects (`from pages import SomePage`) rather than raw selectors in the",
         "  test — instantiate with the `page` fixture and call their methods. Assert with Playwright's",
         "  web-first `expect(...)` (auto-waiting), never manual sleeps, and prefer role/label/text",
         "  locators. Use the `page` and `base_url` fixtures.",
         "- If you use `expect(...)`, you MUST import it: `from playwright.sync_api import expect`.",
         "",
-        "For WEB+API or API-only journeys:",
+        "For journeys that touch an API surface:",
         "- Use the `api_request_context` fixture (a Playwright APIRequestContext whose base URL is already",
         "  set and ends with '/'). Call endpoints as paths RELATIVE to that base — i.e. DROP the leading",
         "  slash and do NOT repeat the base URL. Example: for an endpoint listed as `/character/{id}`, call",
         "  `api_request_context.get(f\"character/{character_id}\")`, not `\"/character/{id}\"` and not the",
         "  full URL. Obtain path-param values earlier in the same test (e.g. an id from a list response).",
         "",
-        "For API-only journeys (no web surface):",
+        "For journeys with NO web surface:",
         "- Do NOT use the `page` fixture, do NOT import or use Page Objects, and do NOT use Playwright's",
         "  `expect(...)` Web assertions. Do NOT import `expect`.",
         "",
-        "For WEB-only journeys (no API surface):",
-        "- Do NOT use the `api_request_context` fixture. Use only the `page` fixture, Page Objects, and",
-        "  Playwright's `expect(...)` assertions.",
+        "For journeys with NO API surface:",
+        "- Do NOT use the `api_request_context` fixture.",
+        "",
+        "For EVENT journeys (topics / event_schema — message contracts):",
+        "- Write a CONTRACT test, NOT a broker round-trip. Do NOT connect to Kafka/RabbitMQ/etc., do NOT",
+        "  publish or consume. Use the `message_schema` fixture: `schema = message_schema(\"<EventSchemaName>\")`",
+        "  returns the discovered JSON Schema for that element (use the EXACT element name from the context).",
+        "- Build a sample payload from the message's listed fields (use their example values), then assert it",
+        "  conforms: `import jsonschema; jsonschema.validate(instance=sample, schema=schema)` (a passing",
+        "  validate raises nothing). You MAY also assert that dropping a REQUIRED field raises",
+        "  `jsonschema.exceptions.ValidationError` using `pytest.raises`.",
+        "- Deterministic, needs no running broker. Do NOT use `page` or `api_request_context`.",
+        "",
+        "For DATA journeys (database tables — schema/constraint contracts):",
+        "- Write a READ-ONLY schema/constraint test against the live catalog via the `db_inspector` fixture",
+        "  (a SQLAlchemy Inspector). Do NOT insert/update/delete rows or run DML — introspect only.",
+        "- Useful calls: `db_inspector.get_table_names()`, `get_columns(\"<table>\")` (each a dict with",
+        "  'name'/'type'/'nullable'), `get_pk_constraint(t)`, `get_foreign_keys(t)`, `get_unique_constraints(t)`.",
+        "- Assert what the inventory states: the table exists, expected columns are present, and the NOT NULL /",
+        "  PK / FK / UNIQUE constraints hold. Use the EXACT table name/location from the element.",
+        "- Do NOT use `page` or `api_request_context`.",
         "",
         "Playwright Assertions Reference Guide (Python syntax) — for journeys using `expect(...)`:",
         "Use only these valid `expect` assertions (and their negated counterparts starting with `not_to_`):",
@@ -275,10 +318,11 @@ def build_prompt(inv: CoverageInventory, journey: Journey, *, destructive: bool 
     steps = "\n".join(f"  {i + 1}. {s.action}" for i, s in enumerate(journey.steps)) or "  (none)"
     elements = _elements_for(inv, journey)
     # Declare the journey type so the static system prompt's conditional rules resolve.
-    jtype = journey_type(
-        web=any(e.kind in ("page", "form") for e in elements),
-        api=any(e.kind == "endpoint" for e in elements),
-    )
+    web = any(e.kind in ("page", "form") for e in elements)
+    api = any(e.kind == "endpoint" for e in elements)
+    event = any(e.kind in ("topic", "event_schema") for e in elements)
+    data = any(e.kind in ("table", "migration") for e in elements)
+    jtype = journey_type(web=web, api=api, event=event, data=data)
     safety = ""
     if destructive:
         safety = (
@@ -297,6 +341,23 @@ def build_prompt(inv: CoverageInventory, journey: Journey, *, destructive: bool 
             ".goto(), never invent methods like .navigate():\n"
             f"{sigs}\n"
         )
+    # Ground backend surfaces on the exact fixtures + element names so drafts can't invent them.
+    ev_line = ""
+    if event:
+        names = [e.name for e in elements if e.kind == "event_schema"]
+        if names:
+            ev_line = (
+                "\nEvent schemas — call `message_schema(\"<name>\")` for the JSON Schema, then "
+                "validate a sample with jsonschema. Available: " + ", ".join(names) + ".\n"
+            )
+    db_line = ""
+    if data:
+        tnames = [e.location for e in elements if e.kind in ("table", "migration")]
+        if tnames:
+            db_line = (
+                "\nTables — introspect read-only with the `db_inspector` fixture (SQLAlchemy "
+                "Inspector). Tables: " + ", ".join(tnames) + ".\n"
+            )
     return (
         f"Journey type: {jtype}\n"
         f"System: {inv.system_name}\n"
@@ -306,7 +367,7 @@ def build_prompt(inv: CoverageInventory, journey: Journey, *, destructive: bool 
         f"Goal: {journey.description}\n"
         f"Steps:\n{steps}\n\n"
         f"Elements this journey touches:\n{_render_elements(elements)}\n"
-        f"{po_line}{safety}\n"
+        f"{po_line}{ev_line}{db_line}{safety}\n"
         "Write the first-draft pytest module for this journey."
     )
 
@@ -415,15 +476,18 @@ class PlaywrightAssertionVisitor(ast.NodeVisitor):
                         )
 
 
-def lint_draft(code: str, *, web: bool, api: bool) -> list[str]:
+def lint_draft(code: str, *, web: bool, api: bool, event: bool = False, data: bool = False) -> list[str]:
     """Enforce best practices on a generated test. Returns human-readable violations.
 
     This is the 'guarantee, don't hope' check: drafts that violate it are regenerated once
-    with the findings, then quarantined out of the runnable suite if still non-conforming."""
+    with the findings, then quarantined out of the runnable suite if still non-conforming.
+    Web/API checks are gated on those surfaces; EVENT/DATA add their own contract-test checks."""
     findings: list[str] = []
     if any(b in code for b in _BANNED):
         findings.append("uses a hard sleep — rely on Playwright auto-waiting / expect()")
-    if "assert" not in code and "expect(" not in code:
+    # `validate(` (jsonschema) and `raises` (pytest.raises) are assertion forms too — an event
+    # contract test may assert purely by a schema validate that raises on a non-conforming payload.
+    if not any(tok in code for tok in ("assert", "expect(", "raises", "validate(")):
         findings.append("has no assertions")
     if "expect(" in code and "import expect" not in code:
         findings.append("uses expect() but never imports it (from playwright.sync_api import expect)")
@@ -451,6 +515,15 @@ def lint_draft(code: str, *, web: bool, api: bool) -> list[str]:
     if api and not web:
         if "api_request_context" not in code and "ApiClient" not in code:
             findings.append("API flow must use the api_request_context fixture")
+    if event:
+        if "message_schema" not in code and "jsonschema" not in code:
+            findings.append(
+                "event contract test must validate against a discovered schema "
+                "(use the message_schema fixture and jsonschema.validate)"
+            )
+    if data:
+        if "db_inspector" not in code:
+            findings.append("database contract test must introspect via the db_inspector fixture")
     return findings
 
 
@@ -524,6 +597,8 @@ async def _regenerate_and_validate(
     label: str,
     output: str,
     prior_code: str,
+    event: bool = False,
+    data: bool = False,
 ) -> tuple[TestDraft, str, str, bool]:
     """One corrective regeneration from a runtime failure (the failing code + pytest output
     are fed back). Returns the new (draft, body, header) and whether it is `clean` — i.e.
@@ -534,7 +609,9 @@ async def _regenerate_and_validate(
     )
     body = draft.code.strip() + "\n"
     header = _header(inv, journey, draft, destructive=False)
-    clean = not lint_draft(draft.code, web=web, api=api) and _compiles(header + body, f"{stem}.py")
+    clean = not lint_draft(draft.code, web=web, api=api, event=event, data=data) and _compiles(
+        header + body, f"{stem}.py"
+    )
     return draft, body, header, clean
 
 
@@ -553,6 +630,8 @@ async def _verify_and_heal(
     into: Path,
     web: bool,
     api: bool,
+    event: bool = False,
+    data: bool = False,
 ) -> tuple[TestDraft, str, str, bool]:
     """Run the just-written test once; on failure attempt ONE self-healing retry, and
     return the (possibly updated) draft/body/header plus whether it is still failing.
@@ -568,7 +647,8 @@ async def _verify_and_heal(
 
     retry, retry_body, retry_header, clean = await _regenerate_and_validate(
         inv, journey, provider, prompt=prompt, system_prompt=system_prompt,
-        web=web, api=api, stem=stem, label=f"write:{stem}", output=output, prior_code=draft.code,
+        web=web, api=api, event=event, data=data, stem=stem, label=f"write:{stem}",
+        output=output, prior_code=draft.code,
     )
     # Adopt the retry only if it is itself clean & runnable; otherwise keep the original.
     if clean:
@@ -643,6 +723,8 @@ async def draft_tests(
         els = _elements_for(inv, journey)
         web = any(e.kind in ("page", "form") for e in els)
         api = any(e.kind == "endpoint" for e in els)
+        event = any(e.kind in ("topic", "event_schema") for e in els)
+        data = any(e.kind in ("table", "migration") for e in els)
         # Compute the test name first so usage is attributed per test ("write:<test>").
         stem = _unique(f"test_{_func_name(journey.name)}", used)
         test_path = tests_dir / f"{stem}.py"
@@ -665,13 +747,19 @@ async def draft_tests(
         draft = await provider.generate_structured(
             prompt, TestDraft, system=system_prompt, label=f"write:{stem}"
         )
-        findings = lint_draft(draft.code, web=web, api=api)
+        findings = lint_draft(draft.code, web=web, api=api, event=event, data=data)
         if findings:
             # one corrective retry with the specific violations fed back to the model
             draft = await provider.generate_structured(
                 prompt + _corrective(findings), TestDraft, system=system_prompt, label=f"write:{stem}"
             )
-            findings = lint_draft(draft.code, web=web, api=api)
+            findings = lint_draft(draft.code, web=web, api=api, event=event, data=data)
+
+        # Backend contract drafts are read-only by construction; if the model nonetheless
+        # emitted real mutation (DML/commit or a broker publish), guard it like any
+        # destructive flow. Judged from the generated CODE, not the journey prose.
+        if not destructive and (event or data) and _mutates_backend(draft.code):
+            destructive = True
 
         # Inject the skip guard deterministically — never rely on the model to add it.
         guard = _SKIP_BLOCK if destructive else ""
@@ -690,7 +778,7 @@ async def draft_tests(
                     inv, journey, provider,
                     draft=draft, body=body, header=header,
                     prompt=prompt, system_prompt=system_prompt, stem=stem,
-                    path=path, into=into, web=web, api=api,
+                    path=path, into=into, web=web, api=api, event=event, data=data,
                 )
 
             result = WriteResult(
@@ -762,6 +850,13 @@ def _infer_web_api(src: str) -> tuple[bool, bool]:
     return web, api
 
 
+def _infer_event_data(src: str) -> tuple[bool, bool]:
+    """Best-effort EVENT/DATA classification from a test's source, for the same fallback path."""
+    event = "message_schema" in src or "jsonschema" in src
+    data = "db_inspector" in src
+    return event, data
+
+
 async def heal_failing_tests(
     inv: CoverageInventory,
     provider: LLMProvider,
@@ -806,8 +901,11 @@ async def heal_failing_tests(
             els = _elements_for(inv, journey)
             web = any(e.kind in ("page", "form") for e in els)
             api = any(e.kind == "endpoint" for e in els)
+            event = any(e.kind in ("topic", "event_schema") for e in els)
+            data = any(e.kind in ("table", "migration") for e in els)
         else:
             web, api = _infer_web_api(src)
+            event, data = _infer_event_data(src)
             name = (_header_value(src, "# Journey:") or path.stem).split("—")[0].strip()
             journey = Journey(
                 name=name, description="(re-grounded from the failing test for a fix)",
@@ -818,7 +916,7 @@ async def heal_failing_tests(
             inv, journey, provider,
             prompt=build_prompt(inv, journey),
             system_prompt=_SYSTEM_PROMPT,
-            web=web, api=api, stem=path.stem, label=f"fix:{path.stem}",
+            web=web, api=api, event=event, data=data, stem=path.stem, label=f"fix:{path.stem}",
             output=output, prior_code=src,
         )
         if not clean:

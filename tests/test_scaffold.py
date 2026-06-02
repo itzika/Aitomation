@@ -228,3 +228,96 @@ def test_scaffold_is_deterministic(tmp_path):
     fa = (a / "api_client.py").read_text()
     fb = (b / "api_client.py").read_text()
     assert fa == fb
+
+
+# --- backend surfaces (events + databases) -----------------------------------------------
+
+
+def _event_inventory() -> CoverageInventory:
+    return CoverageInventory(
+        system_name="Orders Events",
+        base_url="kafka://broker",
+        source="asyncapi",
+        elements=[
+            Element(kind="topic", name="orderCreated", location="orders.created", method="receive",
+                    description="Order placed.", priority="high"),
+            Element(
+                kind="event_schema", name="OrderCreated", location="orders.created",
+                description="Order created event.", priority="high",
+                inputs=[InputField(name="orderId", type="string", required=True, where="message")],
+                json_schema={"type": "object", "required": ["orderId"],
+                             "properties": {"orderId": {"type": "string"}}},
+            ),
+        ],
+    )
+
+
+def _db_inventory() -> CoverageInventory:
+    return CoverageInventory(
+        system_name="shop (sqlite schema)",
+        base_url="sqlite:///shop.db",
+        source="db_schema",
+        elements=[
+            Element(
+                kind="table", name="users", location="users", description="Users table.",
+                priority="high",
+                inputs=[
+                    InputField(name="id", type="INTEGER", required=True, where="column"),
+                    InputField(name="email", type="TEXT", required=True, where="column"),
+                ],
+                preconditions=["PRIMARY KEY (id)", "UNIQUE (email)"],
+            ),
+        ],
+    )
+
+
+def test_context_backend_flags_and_lists():
+    ev = inventory_to_context(_event_inventory())
+    assert ev["has_events"] is True and ev["has_db"] is False
+    assert {t["name"] for t in ev["topics"]} == {"orderCreated"}
+    assert ev["event_schemas"][0]["has_schema"] is True
+
+    db = inventory_to_context(_db_inventory())
+    assert db["has_db"] is True and db["has_events"] is False
+    cols = {c["name"] for c in db["tables"][0]["columns"]}
+    assert cols == {"id", "email"}
+
+
+def test_scaffold_event_project(tmp_path):
+    dest = scaffold_project(_event_inventory(), tmp_path / "e2e")
+    _compiles(dest / "conftest.py")
+    _compiles(dest / "tests/test_smoke.py")
+
+    conftest = (dest / "conftest.py").read_text()
+    assert "def message_schema(" in conftest and "schemas.json" in conftest
+    # event-only: no browser/api fixtures leaked in
+    assert "api_request_context" not in conftest
+
+    # the discovered schema is emitted verbatim for jsonschema.validate(...)
+    import json
+    schemas = json.loads((dest / "schemas.json").read_text())
+    assert schemas["OrderCreated"]["required"] == ["orderId"]
+
+    assert "jsonschema>=4" in (dest / "pyproject.toml").read_text()
+    assert "test_message_schemas_load" in (dest / "tests/test_smoke.py").read_text()
+
+
+def test_scaffold_db_project(tmp_path):
+    dest = scaffold_project(_db_inventory(), tmp_path / "e2e")
+    _compiles(dest / "conftest.py")
+    _compiles(dest / "tests/test_smoke.py")
+
+    conftest = (dest / "conftest.py").read_text()
+    assert "def db_inspector(" in conftest and "DATABASE_URL" in conftest
+    assert "sqlalchemy>=2" in (dest / "pyproject.toml").read_text()
+    assert "DATABASE_URL=" in (dest / ".env.example").read_text()
+    assert "test_database_reachable" in (dest / "tests/test_smoke.py").read_text()
+    # no schemas.json when there are no event schemas
+    assert not (dest / "schemas.json").exists()
+
+
+def test_pure_backend_scaffold_has_no_placeholder(tmp_path):
+    dest = scaffold_project(_db_inventory(), tmp_path / "e2e")
+    smoke = (dest / "tests/test_smoke.py").read_text()
+    # backend smoke present means the empty placeholder must NOT be emitted
+    assert "test_placeholder" not in smoke

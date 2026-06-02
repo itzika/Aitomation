@@ -44,6 +44,14 @@ has_api:
   type: bool
   default: true
 
+has_db:
+  type: bool
+  default: false
+
+has_events:
+  type: bool
+  default: false
+
 smoke_path:
   type: str
   default: "/"
@@ -61,6 +69,18 @@ pages:
   default: []
 
 endpoints:
+  type: yaml
+  default: []
+
+tables:
+  type: yaml
+  default: []
+
+topics:
+  type: yaml
+  default: []
+
+event_schemas:
   type: yaml
   default: []
 
