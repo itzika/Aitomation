@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from textual.widgets import DataTable, Input
+from textual.widgets import DataTable, Input, RadioButton, RadioSet
 
 from aitomation.models import CoverageInventory, Journey
 from aitomation.models import TestableElement as Element  # aliased: avoid pytest "Test*" collection
@@ -502,3 +502,60 @@ async def test_wizard_requires_origin(tmp_path):
         wizard._submit()  # empty origin -> stays open
         await pilot.pause()
         assert isinstance(app.screen, WizardScreen)
+
+
+# -- wizard surfaces the backend discovery sources (Tier 1) -----------------------------
+
+
+async def test_wizard_offers_backend_sources(tmp_path):
+    app = _app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("n")
+        await pilot.pause()
+        rs = app.screen.query_one("#source", RadioSet)
+        labels = " ".join(str(b.label) for b in rs.query(RadioButton))
+        assert len([*rs.query(RadioButton)]) == 5
+        assert "AsyncAPI" in labels and "Schema registry" in labels and "Database" in labels
+
+
+def test_wizard_source_keys_in_order():
+    # _submit() maps the selected radio index to this key; run_discover dispatches on it.
+    from aitomation.tui.app import _WIZARD_SOURCES
+
+    assert [s[0] for s in _WIZARD_SOURCES] == ["openapi", "crawl", "asyncapi", "registry", "db"]
+
+
+async def _run_one_discover(app, pilot, source: str, origin: str, fn_name: str) -> dict:
+    """Fire run_discover for one source with the named discover fn patched out, and report
+    the origin it was called with. The patched fn returns a minimal inventory so the worker
+    completes (save/refresh) without a real model or network."""
+    from unittest.mock import patch
+
+    called: dict = {}
+
+    async def fake(origin_, provider):
+        called["origin"] = origin_
+        return CoverageInventory(
+            system_name=f"X-{origin_}", base_url=origin_, source="openapi",
+            elements=[Element(kind="endpoint", name="e", location="/e", method="GET",
+                              description="x", priority="low")],
+        )
+
+    with patch(f"aitomation.tui.app.{fn_name}", fake):
+        app.run_discover(source, origin, None)
+        await pilot.pause()
+        await pilot.pause()
+    return called
+
+
+async def test_tui_dispatches_new_discovery_sources(tmp_path):
+    app = _app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert (await _run_one_discover(app, pilot, "asyncapi", "a.yaml", "discover_asyncapi"))["origin"] == "a.yaml"
+        assert (await _run_one_discover(app, pilot, "registry", "http://r", "discover_registry"))["origin"] == "http://r"
+        assert (await _run_one_discover(app, pilot, "db", "x.sql", "discover_db"))["origin"] == "x.sql"
+        # re-discover passes the inventory's DiscoverySource — both forms must route correctly
+        assert (await _run_one_discover(app, pilot, "schema_registry", "http://r2", "discover_registry"))["origin"] == "http://r2"
+        assert (await _run_one_discover(app, pilot, "db_schema", "y.sql", "discover_db"))["origin"] == "y.sql"
