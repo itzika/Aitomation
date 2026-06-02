@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -34,7 +35,6 @@ from textual.widgets import (
     Button,
     DataTable,
     Footer,
-    Header,
     Input,
     Label,
     ProgressBar,
@@ -45,7 +45,6 @@ from textual.widgets import (
     TabbedContent,
     TabPane,
 )
-from textual.widgets._header import HeaderClock, HeaderClockSpace, HeaderIcon, HeaderTitle
 
 from ..config import Backend, ConfigError, LLMConfig
 from ..diff import diff_inventories
@@ -97,9 +96,10 @@ A system moves through three stages, shown as dots in the library: \
   f   fix: self-heal the tests that just failed (one corrective retry each)
   e   enable the selected skipped (destructive) draft — review + add teardown first
   o   open the run folder — pick VS Code / PyCharm / Cursor / Antigravity
-  m   change the provider/model (or click the model name in the title bar)
+  m   change the provider/model (or click the title in the header)
   d   delete the selected system
   l   toggle the live log
+  b   fold / unfold the animated header banner
   ↑/↓ move · enter open · tab switch panes
   Ctrl+P   command palette
   ?   this help · q quit
@@ -201,67 +201,182 @@ def _resolve_editor(cli_candidates: tuple[str, ...], app_prefixes: tuple[str, ..
     return [cmd] if cmd else None
 
 
-# A neon "light sweep" that travels left-to-right across the title letters: a bright comet
-# head trailing two fading cells, over a dim base, with a short beat between sweeps. Single-hue
-# (dim cyan -> white) so it reads as light gliding over chrome rather than a colour clash.
+# Title shimmer: a single-hue (dim cyan -> white) comet head with a short fading tail that
+# sweeps across the letters, with a beat between sweeps. Single-hue on purpose, so it reads as
+# light gliding over chrome rather than adding to a colour clash.
 _SHIMMER_TIERS = ("#155e6b", "#22d3ee", "#7eecff", "#ffffff")  # base, tail, mid, comet head
 _SHIMMER_GAP = 8  # cells of "pause" appended to the sweep so it pulses instead of running solid
 
+# Matrix-rain backdrop for the header band: ASCII glyphs falling in per-column streaks, each a
+# bright white head trailing a cyan tail that fades to near-black. Same cyan→white family as the
+# title shimmer so the band reads as one effect, not a palette pile-up.
+_RAIN_GLYPHS = "01<>[]{}/\\=+*#$%&!?:;~^|0123456789ABCDEF"
+_RAIN_HEAD = "#eafcff"
+_RAIN_FADE = ("#7eecff", "#22d3ee", "#1a8aa0", "#125663")
+_BAND_HEIGHT = 7
 
-class ShimmerTitle(HeaderTitle):
-    """The header title, animated. Subclasses HeaderTitle so the stock Header still wires it up
-    (and `query_one(HeaderTitle)` keeps finding it); we just take over how it draws and run a
-    cheap ~12fps timer that sweeps a highlight across the letters. Purely cosmetic."""
+
+def _shimmer_style(offset: int) -> str:
+    """Style for a title char `offset` cells behind the sweeping comet head."""
+    if offset == 0:
+        return f"bold {_SHIMMER_TIERS[3]}"
+    if offset == 1:
+        return _SHIMMER_TIERS[2]
+    if offset == 2:
+        return _SHIMMER_TIERS[1]
+    return _SHIMMER_TIERS[0]
+
+
+def _rain_style(d: int, length: int) -> str:
+    """Style for a rain cell `d` cells above its column's head, in a streak of `length`."""
+    if d == 0:
+        return f"bold {_RAIN_HEAD}"
+    f = d / max(length, 1)
+    if f < 0.2:
+        return _RAIN_FADE[0]
+    if f < 0.45:
+        return _RAIN_FADE[1]
+    if f < 0.75:
+        return _RAIN_FADE[2]
+    return _RAIN_FADE[3]
+
+
+class MatrixBanner(Static):
+    """The header: a matrix-rain ASCII animation across the full width with the 'aitomation'
+    title (shimmering) and the active model overlaid and centred. Clicking the title opens the
+    model picker (same as `m`). Collapsible to a single line (press `b`) and PAUSED while an
+    operation runs, so it's a flourish rather than a persistent, distracting backdrop."""
+
+    DEFAULT_CSS = """
+    MatrixBanner {
+        dock: top;
+        width: 100%;
+        height: 7;
+        background: $background;
+        color: $foreground;
+    }
+    MatrixBanner.-folded { height: 1; }
+    """
+
+    def __init__(self, *, id: str | None = None) -> None:
+        super().__init__(id=id)
+        self._expanded = True
+        self._paused = False
+        self._phase = 0  # shimmer comet position
+        self._w = self._h = 0  # last grid size; a change triggers a rebuild (handles resize)
+        self._heads: list[float] = []  # per-column streak head row (fractional for varied speed)
+        self._lens: list[int] = []
+        self._speeds: list[float] = []
+        self._buf: list[list[str]] = []  # the glyph each cell currently shows
+        self._title_row = 0
 
     def on_mount(self) -> None:
-        self._phase = 0
-        self._timer = self.set_interval(0.08, self._advance)
+        self.tooltip = "Click the title to change the model · press b to fold the banner"
+        self.set_interval(1 / 15, self._tick)  # ~15fps; negligible cost, paused during ops
 
-    def _advance(self) -> None:
+    # -- animation state ----------------------------------------------------------------
+
+    def _ensure(self, w: int, h: int) -> None:
+        if w == self._w and h == self._h:
+            return
+        self._w, self._h = w, h
+        self._heads = [random.uniform(-h, 0) for _ in range(w)]
+        self._lens = [random.randint(3, max(h, 3)) for _ in range(w)]
+        self._speeds = [random.uniform(0.25, 0.7) for _ in range(w)]
+        self._buf = [[" "] * w for _ in range(h)]
+
+    def _tick(self) -> None:
+        if self._paused:
+            return
         title = self.app.title or ""
         self._phase = (self._phase + 1) % max(len(title) + _SHIMMER_GAP, 1)
+        if self._expanded:
+            w, h = self.size.width, self.size.height
+            if w > 0 and h > 1:
+                self._ensure(w, h)
+                for c in range(w):
+                    prev = int(self._heads[c])
+                    self._heads[c] += self._speeds[c]
+                    cur = int(self._heads[c])
+                    for rr in range(prev + 1, cur + 1):  # the head writes a new glyph as it falls
+                        if 0 <= rr < h:
+                            self._buf[rr][c] = random.choice(_RAIN_GLYPHS)
+                    if cur - self._lens[c] > h:  # streak fully off the bottom -> respawn at top
+                        self._heads[c] = random.uniform(-h, -1.0)
+                        self._lens[c] = random.randint(3, max(h, 3))
+                        self._speeds[c] = random.uniform(0.25, 0.7)
         self.refresh()
 
-    def render(self) -> Text:
-        title = self.app.title or ""
-        head = getattr(self, "_phase", 0)
-        text = Text(justify="center", no_wrap=True)
+    def pause(self, paused: bool) -> None:
+        """Freeze/resume the animation — called around long operations so the rain doesn't
+        churn (and steal attention) while real work is happening."""
+        self._paused = paused
+
+    def toggle(self) -> None:
+        self._expanded = not self._expanded
+        self.set_class(not self._expanded, "-folded")
+        self.refresh()
+
+    # -- rendering ----------------------------------------------------------------------
+
+    def _compact(self, w: int) -> Text:
+        """Folded view: just the shimmering title + model on one centred line (no rain)."""
+        title, sub = self.app.title or "", self.app.sub_title or ""
+        line = Text(no_wrap=True)
         for i, ch in enumerate(title):
-            offset = head - i  # comet head at i == head, fading tail to its left
-            tier = _SHIMMER_TIERS[3] if offset == 0 else (
-                _SHIMMER_TIERS[2] if offset == 1 else
-                _SHIMMER_TIERS[1] if offset == 2 else _SHIMMER_TIERS[0]
-            )
-            text.append(ch, style=f"bold {tier}" if offset == 0 else tier)
-        sub = self.app.sub_title or ""
+            line.append(ch, style=_shimmer_style(self._phase - i))
         if sub:
-            text.append("   ")
-            text.append(sub, style="dim #7a8a99")
+            line.append("   ")
+            line.append(sub, style="dim #7a8a99")
+        out = Text(" " * max(0, (w - line.cell_len) // 2))
+        out.append_text(line)
+        return out
+
+    def render(self) -> Text:
+        w, h = self.size.width, self.size.height
+        if w <= 0 or h <= 0:
+            return Text("")
+        if not self._expanded or h <= 1:
+            return self._compact(w)
+        self._ensure(w, h)
+
+        chars = [[" "] * w for _ in range(h)]
+        styles: list[list[str]] = [[""] * w for _ in range(h)]
+        for c in range(w):
+            head = int(self._heads[c])
+            for r in range(h):
+                d = head - r
+                if 0 <= d < self._lens[c]:
+                    g = self._buf[r][c]
+                    chars[r][c] = g if g != " " else random.choice(_RAIN_GLYPHS)
+                    styles[r][c] = _rain_style(d, self._lens[c])
+
+        # Overlay the title (shimmering) and model, centred — these cells override the rain so
+        # they stay readable.
+        self._title_row = h // 2
+        title, sub = self.app.title or "", self.app.sub_title or ""
+        ts = max(0, (w - len(title)) // 2)
+        for i, ch in enumerate(title):
+            if ts + i < w:
+                chars[self._title_row][ts + i] = ch
+                styles[self._title_row][ts + i] = _shimmer_style(self._phase - i)
+        if sub and self._title_row + 1 < h:
+            ms = max(0, (w - len(sub)) // 2)
+            for i, ch in enumerate(sub):
+                if ms + i < w:
+                    chars[self._title_row + 1][ms + i] = ch
+                    styles[self._title_row + 1][ms + i] = "bold #cdd9e0"
+
+        text = Text(no_wrap=True)
+        for r in range(h):
+            for c in range(w):
+                text.append(chars[r][c], style=styles[r][c] or None)
+            if r < h - 1:
+                text.append("\n")
         return text
 
-
-class ModelHeader(Header):
-    """The app header, but its title is clickable to switch the active provider/model.
-    (The default Header click just expands a clock row we don't use, so we repurpose it.)"""
-
-    def compose(self) -> ComposeResult:
-        # Mirror Header.compose, swapping in the animated title.
-        yield HeaderIcon().data_bind(Header.icon)
-        yield ShimmerTitle()
-        yield (
-            HeaderClock().data_bind(Header.time_format)
-            if self._show_clock
-            else HeaderClockSpace()
-        )
-
-    def _on_mount(self, event) -> None:
-        super()._on_mount(event)
-        try:
-            self.query_one(HeaderTitle).tooltip = "Click to change the model (or press m)"
-        except Exception:  # pragma: no cover - tooltip is cosmetic
-            pass
-
-    def _on_click(self) -> None:
+    def on_click(self) -> None:
+        # Clicking the header opens the model picker — same metaphor as the old title bar.
         self.app.action_choose_model()
 
 
@@ -574,12 +689,13 @@ class AitomationApp(App):
         Binding("o", "open_editor", "Open"),
         Binding("d", "delete", "Delete"),
         Binding("l", "toggle_log", "Log"),
+        Binding("b", "toggle_banner", "Banner"),
         Binding("m", "choose_model", "Model"),
         Binding("question_mark", "help", "Help"),
         Binding("q", "quit", "Quit"),
     ]
     COMMANDS = App.COMMANDS | {WorkbenchCommands}
-    TITLE = "aitomation"
+    TITLE = "Aitomation"
 
     def __init__(
         self,
@@ -615,7 +731,7 @@ class AitomationApp(App):
     # -- layout -------------------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        yield ModelHeader(show_clock=True)
+        yield MatrixBanner(id="banner")
         with Horizontal(id="main"):
             systems = DataTable(id="systems", cursor_type="row")
             systems.border_title = "systems"
@@ -722,10 +838,18 @@ class AitomationApp(App):
         if status:
             self.query_one("#status", Static).update(msg)
 
+    def _set_banner_paused(self, paused: bool) -> None:
+        # Freeze the header animation around long operations; tolerate the banner being absent.
+        try:
+            self.query_one(MatrixBanner).pause(paused)
+        except Exception:  # noqa: BLE001 — purely cosmetic, never block an op on it
+            pass
+
     def _begin_progress(self, total: int | None, label: str) -> None:
         bar = self.query_one("#progress", ProgressBar)
         bar.display = True
         bar.update(total=total, progress=0)
+        self._set_banner_paused(True)
         self._log(label)
 
     def _advance_progress(self, n: int = 1) -> None:
@@ -733,11 +857,15 @@ class AitomationApp(App):
 
     def _end_progress(self, label: str = "") -> None:
         self.query_one("#progress", ProgressBar).display = False
+        self._set_banner_paused(False)
         if label:
             self._log(label)
 
     def action_toggle_log(self) -> None:
         self.query_one("#log", RichLog).toggle_class("-hidden")
+
+    def action_toggle_banner(self) -> None:
+        self.query_one(MatrixBanner).toggle()
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
