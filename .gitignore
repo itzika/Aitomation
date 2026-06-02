@@ -1,0 +1,47 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# macOS
+.DS_Store
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local editor / agent settings
+.claude/settings.local.json
+.idea/
+.vscode/
+
+# Generated discovery artifacts (CLI output)
+/inventory.json
+*.inventory.json
+
+# Generated output: scaffolds, drafts, and TUI workspaces (regenerable, not source).
+# The toolkit writes here by default; everything under it is produced, never authored.
+/projects/
+
+# Legacy generated output from before the projects/ layout (regenerable; safe to delete).
+/e2e/
+/.aitomation/
+/the-rick-and-morty-api/
+/swag-labs/
+
+# LLM usage telemetry
+usage.jsonl
+*.usage.jsonl
+
+# Personal local utility, not part of this project
+/space_saver.sh
+
+# Secrets
+.env

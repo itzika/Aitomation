@@ -1,0 +1,37 @@
+[project]
+name = "aitomation"
+version = "0.1.0"
+description = "Discovery Toolkit — compresses the cold-start of test automation."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "copier>=9.15.1",
+    "playwright>=1.60.0",
+    "pydantic-ai-slim[anthropic,openai]>=1.104.0",
+    "python-dotenv>=1.2.2",
+    "pyyaml>=6.0.3",
+    "textual>=8.2.7",
+    "typer>=0.26.4",
+]
+
+[project.scripts]
+aitomation = "aitomation.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.4.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aitomation"]
+# Copier template ships inside the package; force-include so dotfiles/.jinja aren't dropped.
+artifacts = ["src/aitomation/scaffold/template/**"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
