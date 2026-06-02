@@ -1,0 +1,19 @@
+"""Reporting hook — intentionally left as an interface.
+
+Triage / reporting-intelligence is a SEPARATE product and deliberately out of scope for
+the scaffold. Implement this Protocol to forward results somewhere; the scaffold itself
+never decides pass/fail and never ships results anywhere.
+"""
+
+from typing import Protocol
+
+
+class ReportingHook(Protocol):
+    def on_result(self, *, test_id: str, outcome: str, duration_s: float) -> None: ...
+
+
+class NullReportingHook:
+    """Default no-op. Swap in your own implementation downstream."""
+
+    def on_result(self, *, test_id: str, outcome: str, duration_s: float) -> None:
+        return None

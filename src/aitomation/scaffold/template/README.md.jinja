@@ -1,0 +1,32 @@
+# {{ project_name }} — E2E tests
+
+Scaffolded by **Aitomation** from a CoverageInventory (source: `{{ source }}`, generated {{ generated_at }}).
+Human-authoritative: review everything before relying on it. Nothing here was auto-merged.
+
+- Base URL: `{{ base_url }}`
+- Auth strategy: `{{ auth_strategy }}`
+- Discovered: {{ pages | length }} page(s), {{ endpoints | length }} endpoint(s), {{ journeys | length }} suggested journey(s)
+
+## Run
+
+```bash
+uv sync
+uv run playwright install chromium
+BASE_URL={{ base_url }} uv run pytest
+```
+{% if auth_strategy != "none" %}
+Auth is `{{ auth_strategy }}` — set the relevant env vars (see `conftest.py`).
+{% endif %}
+
+## Layout
+
+- `conftest.py` — fixtures (base_url, auth, API request context)
+{% if has_browser %}- `pages.py` — page objects seeded from discovered pages
+{% endif %}{% if has_api %}- `api_client.py` — client seeded from discovered endpoints
+{% endif %}- `tests/` — smoke tests (draft journey tests come from the Write stage)
+- `reporting.py` — reporting hook interface (triage is a separate product)
+
+## Suggested journeys to cover (from discovery)
+{% for j in journeys %}
+- **{{ j.name }}** — {{ j.description }}
+{% endfor %}

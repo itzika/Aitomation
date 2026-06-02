@@ -1,0 +1,9 @@
+# Playwright test runner for {{ project_name }} (scaffolded by Aitomation).
+FROM mcr.microsoft.com/playwright/python:v1.60.0-noble
+
+WORKDIR /tests
+COPY . .
+RUN pip install --no-cache-dir pytest pytest-playwright
+
+ENV BASE_URL={{ base_url }}
+CMD ["pytest", "-ra"]

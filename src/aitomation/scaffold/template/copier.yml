@@ -1,0 +1,69 @@
+# Aitomation scaffold template — pytest + pytest-playwright.
+# Driven programmatically (copier run_copy with data=...); defaults keep it non-interactive.
+_subdirectory: "."
+
+# Tidy whitespace from {% %} blocks so generated files read cleanly.
+_envops:
+  trim_blocks: true
+  lstrip_blocks: true
+  keep_trailing_newline: true
+
+project_name:
+  type: str
+  default: "Discovered System"
+
+package_slug:
+  type: str
+  default: "system_under_test"
+
+base_url:
+  type: str
+  default: "http://localhost"
+
+auth_strategy:
+  type: str
+  default: "none"
+
+auth_kind:
+  type: str
+  default: "none"
+
+auth_header_name:
+  type: str
+  default: "Authorization"
+
+auth_in:
+  type: str
+  default: "header"
+
+has_browser:
+  type: bool
+  default: true
+
+has_api:
+  type: bool
+  default: true
+
+smoke_path:
+  type: str
+  default: "/"
+
+source:
+  type: str
+  default: "openapi"
+
+generated_at:
+  type: str
+  default: ""
+
+pages:
+  type: yaml
+  default: []
+
+endpoints:
+  type: yaml
+  default: []
+
+journeys:
+  type: yaml
+  default: []

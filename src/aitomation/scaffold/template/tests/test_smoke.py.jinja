@@ -1,0 +1,23 @@
+"""Smoke tests for {{ project_name }} — generated scaffold.
+
+Deterministic assertions only. First-draft journey tests come from the Write stage; these
+just prove the framework wiring is sound and the system is reachable.
+"""
+{% if has_api %}
+
+def test_api_reachable(api_request_context):
+    resp = api_request_context.get("{{ smoke_path }}")
+    assert resp.status < 500
+{% endif %}
+{% if has_browser %}
+
+def test_home_loads(page, base_url):
+    page.goto(base_url)
+    assert page.title() is not None
+{% endif %}
+{% if not has_api and not has_browser %}
+
+def test_placeholder():
+    # Nothing testable was discovered; replace once the inventory has elements.
+    assert True
+{% endif %}

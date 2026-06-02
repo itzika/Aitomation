@@ -1,0 +1,20 @@
+[project]
+name = "{{ package_slug }}-e2e"
+version = "0.1.0"
+description = "End-to-end tests for {{ project_name }}, scaffolded by Aitomation."
+requires-python = ">=3.12"
+dependencies = [
+    "pytest>=8",
+    "pytest-playwright>=0.5",
+]
+
+[tool.pytest.ini_options]
+# Pro defaults: capture a Playwright trace + screenshot on failure for debugging, into
+# test-results/. View a trace with:  uv run playwright show-trace test-results/<...>.zip
+addopts = "-ra --tracing=retain-on-failure --screenshot=only-on-failure --output=test-results"
+testpaths = ["tests"]
+markers = [
+    "smoke: fast checks that the framework wiring and system are reachable",
+    "flow: a drafted end-to-end flow test",
+    "destructive: mutates server state; review and add teardown before enabling",
+]
