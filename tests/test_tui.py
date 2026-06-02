@@ -250,9 +250,59 @@ async def test_tests_tab_reflects_run_outcome(tmp_path):
         statuses = {n: s for n, s, _ in app._test_files}
         assert statuses["test_thing.py"] == "passed"
 
-        # selecting another system (or re-selecting) drops run outcomes (per-system state)
+        # re-selecting rehydrates from disk: nothing was persisted here, so outcomes are empty
         app._select_system(0)
         assert app._test_outcomes == {}
+
+
+async def test_run_outcomes_survive_restart(tmp_path):
+    # The bug: after a run, the Tests-tab status reset to static markers on restart because
+    # outcomes lived only in memory. They are now persisted per-run and rehydrated on select.
+    _seed(tmp_path)
+    app = _app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.action_scaffold()
+        await pilot.pause()
+        run = Path(app.current.latest_run)
+        (run / "tests" / "test_thing.py").write_text(
+            "def test_thing(api_request_context):\n    assert True\n"
+        )
+        # simulate a completed run that recorded a pass, then persisted it
+        app._test_outcomes = {"test_thing.py": "passed"}
+        app._save_outcomes(run)
+        assert (run / ".aito-status.json").is_file()
+
+    # a fresh app instance (== a restart) over the same workspace must show 'passed', not 'ok'
+    app2 = _app(tmp_path)
+    async with app2.run_test() as pilot:
+        await pilot.pause()
+        assert app2._test_outcomes.get("test_thing.py") == "passed"
+        statuses = {n: s for n, s, _ in app2._test_files}
+        assert statuses["test_thing.py"] == "passed"
+
+
+async def test_run_outcomes_rehydrate_from_pytest_output(tmp_path):
+    # Fallback path: runs recorded before the status file existed still light up by parsing
+    # the persisted pytest-output.txt.
+    _seed(tmp_path)
+    app = _app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.action_scaffold()
+        await pilot.pause()
+        run = Path(app.current.latest_run)
+        (run / "tests" / "test_thing.py").write_text(
+            "def test_thing(api_request_context):\n    assert True\n"
+        )
+        (run / "pytest-output.txt").write_text(
+            "==== short test summary info ====\nFAILED tests/test_thing.py::test_thing - boom\n"
+        )
+        # no .aito-status.json on purpose → must fall back to parsing pytest-output.txt
+        app._select_system(0)
+        assert app._test_outcomes.get("test_thing.py") == "failed"
+        statuses = {n: s for n, s, _ in app._test_files}
+        assert statuses["test_thing.py"] == "failed"
 
 
 async def test_enable_action_gated_to_skipped_selection(tmp_path):

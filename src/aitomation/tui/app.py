@@ -9,6 +9,7 @@ land in visible, timestamped per-run directories under each tested app.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -126,6 +127,10 @@ _STATUS_STYLE = {
     "skipped · destructive": "#ffd400",
     "needs review": "#ffd400",
 }
+
+# Latest per-file run outcomes, persisted next to pytest-output.txt in a run dir so the
+# Tests-tab status survives a TUI restart instead of resetting to static file markers.
+_STATUS_FILE = ".aito-status.json"
 
 # Outcome precedence when a file has several tests: failure/error > pass > skip.
 _OUTCOME_RANK = {"skipped": 0, "xfail": 0, "xpass": 0, "passed": 1, "failed": 2, "error": 2}
@@ -746,8 +751,40 @@ class AitomationApp(App):
             return
         self.current = self._records[idx]
         self.current_inv = self.workspace.load_inventory(self.current.slug)
-        self._test_outcomes = {}  # run outcomes are per-system; don't bleed across selections
+        # Rehydrate the latest run's per-file outcomes from disk so the Tests-tab status
+        # survives a restart / re-selection (per-system; never bled across selections).
+        run = self.current.latest_run
+        self._test_outcomes = self._load_outcomes(Path(run)) if run else {}
         self._populate_tabs()
+
+    def _load_outcomes(self, run: Path) -> dict[str, str]:
+        """The latest run's per-file pass/fail, read back from disk so the Tests-tab status
+        SURVIVES a restart instead of resetting to static file markers. Prefers the small
+        status file we write after each run/fix; falls back to parsing the persisted pytest
+        output (so runs recorded before this existed still light up). This is the last run's
+        view kept next to pytest-output.txt — not a cross-run results store."""
+        status = run / _STATUS_FILE
+        if status.is_file():
+            try:
+                data = json.loads(status.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return {str(k): str(v) for k, v in data.items()}
+            except (json.JSONDecodeError, OSError):
+                pass
+        out = run / "pytest-output.txt"
+        if out.is_file():
+            try:
+                return _parse_pytest_outcomes(out.read_text(encoding="utf-8").splitlines())
+            except OSError:
+                pass
+        return {}
+
+    def _save_outcomes(self, run: Path) -> None:
+        """Persist the current per-file outcomes next to pytest-output.txt (see _load_outcomes)."""
+        try:
+            (run / _STATUS_FILE).write_text(json.dumps(self._test_outcomes), encoding="utf-8")
+        except OSError:
+            pass
 
     def _current_index(self) -> int:
         for i, r in enumerate(self.workspace.list_systems()):
@@ -1247,8 +1284,10 @@ class AitomationApp(App):
         self.notify(f"pytest: {counts}", severity="information" if rc == 0 else "warning", timeout=8)
         self._last_run_failed = rc != 0
         self.refresh_bindings()  # reveal/hide [f] in the footer
-        # Reflect THIS run's per-test results in the Tests tab status column.
+        # Reflect THIS run's per-test results in the Tests tab status column, and persist them
+        # so the status survives a restart (rehydrated on select via _load_outcomes).
         self._test_outcomes = _parse_pytest_outcomes(captured)
+        self._save_outcomes(run)
         self._render_tests()
         self.push_screen(
             ResultsScreen(f"pytest — {counts}", "\n".join(tail), has_failures=rc != 0), self._on_results
@@ -1328,6 +1367,7 @@ class AitomationApp(App):
             self._test_outcomes[r.path.name] = "passed"
         for r in report.still_failing:
             self._test_outcomes[r.path.name] = "failed"
+        self._save_outcomes(dest)  # so the heal result survives a restart too
         self._render_tests()  # refresh per-file status (failing drafts now flagged)
         self.query_one("#tabs", TabbedContent).active = "tab-tests"
 
