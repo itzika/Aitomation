@@ -412,13 +412,13 @@ async def test_model_picker_opens_and_closes(tmp_path):
 
 
 async def test_clicking_title_bar_opens_model_picker(tmp_path):
-    from textual.widgets._header import HeaderTitle
+    from aitomation.tui.app import MatrixBanner
 
     _seed(tmp_path)
     app = _app(tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
-        await pilot.click(HeaderTitle)  # click the "aitomation — backend:model" title
+        await pilot.click(MatrixBanner)  # centre of the band == the title row -> model picker
         await pilot.pause()
         assert isinstance(app.screen, ModelScreen)
 
@@ -609,3 +609,36 @@ async def test_tui_dispatches_new_discovery_sources(tmp_path):
         # re-discover passes the inventory's DiscoverySource — both forms must route correctly
         assert (await _run_one_discover(app, pilot, "schema_registry", "http://r2", "discover_registry"))["origin"] == "http://r2"
         assert (await _run_one_discover(app, pilot, "db_schema", "y.sql", "discover_db"))["origin"] == "y.sql"
+
+
+async def test_header_banner_animates_folds_and_pauses(tmp_path):
+    # Cosmetic header band: renders the title over a matrix-rain backdrop, animates on tick,
+    # folds to one line (b), and freezes while an operation runs.
+    from aitomation.tui.app import MatrixBanner
+
+    app = _app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        banner = app.query_one(MatrixBanner)
+
+        # the title is rendered (over the rain) and the animation advances on tick
+        assert "aitomation" in banner.render().plain
+        before = banner._phase
+        banner._tick()
+        assert banner._phase != before
+
+        # fold/unfold via the binding flips expanded + the -folded class
+        assert banner._expanded is True
+        await pilot.press("b")
+        assert banner._expanded is False and banner.has_class("-folded")
+        await pilot.press("b")
+        assert banner._expanded is True and not banner.has_class("-folded")
+
+        # operations pause the animation, then resume
+        app._set_banner_paused(True)
+        frozen = banner._phase
+        banner._tick()
+        assert banner._phase == frozen  # paused -> no advance
+        app._set_banner_paused(False)
+        banner._tick()
+        assert banner._phase != frozen
