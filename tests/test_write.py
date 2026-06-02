@@ -440,29 +440,36 @@ def test_lint_draft_catches_invalid_assertion_method():
 
 def test_system_prompt_is_static_and_complete():
     # One invariant prompt (no args) so the cached prefix is reused across every write/fix
-    # call. It must carry ALL rule sets — web, API, and both — gated by the journey type the
-    # user prompt declares, rather than being conditionally trimmed per call.
+    # call. It must carry ALL per-surface rule sets — web, API, event, data — gated by the
+    # surface tags the user prompt declares, rather than being conditionally trimmed per call.
     prompt = build_system_prompt()
     assert prompt == _SYSTEM_PROMPT  # the module constant IS the static prompt
-    assert "For WEB+API or WEB-only journeys:" in prompt
-    assert "For WEB+API or API-only journeys:" in prompt
-    assert "For API-only journeys (no web surface):" in prompt
-    assert "For WEB-only journeys (no API surface):" in prompt
+    assert "For journeys that touch a WEB surface:" in prompt
+    assert "For journeys that touch an API surface:" in prompt
+    assert "For journeys with NO web surface:" in prompt
+    assert "For journeys with NO API surface:" in prompt
+    assert "For EVENT journeys" in prompt
+    assert "For DATA journeys" in prompt
     # All the load-bearing guidance survives in the single prompt.
     assert "Use the generated Page Objects" in prompt
     assert "Use the `api_request_context` fixture" in prompt
     assert "Playwright Assertions Reference Guide" in prompt
+    assert "message_schema" in prompt and "db_inspector" in prompt
 
 
 def test_build_prompt_declares_journey_type():
     inv = _inv()
-    # API-only inventory (_inv builds endpoints) → user prompt must state the type so the
-    # static system prompt's conditional rules resolve.
+    # API inventory (_inv builds endpoints) → user prompt must state the surface tags so the
+    # static system prompt's per-surface rules resolve.
     journey = inv.suggested_journeys[0]
-    assert "Journey type: API-only" in build_prompt(inv, journey)
+    assert "Journey type: API" in build_prompt(inv, journey)
+    # composable surface tags
     assert journey_type(web=True, api=True) == "WEB+API"
-    assert journey_type(web=False, api=True) == "API-only"
-    assert journey_type(web=True, api=False) == "WEB-only"
+    assert journey_type(web=False, api=True) == "API"
+    assert journey_type(web=True, api=False) == "WEB"
+    assert journey_type(web=False, api=False, event=True) == "EVENT"
+    assert journey_type(web=False, api=False, data=True) == "DATA"
+    assert journey_type(web=False, api=True, event=True) == "API+EVENT"
 
 
 def test_draft_tests_verify_self_heals_failures(tmp_path):
@@ -718,3 +725,143 @@ def test_heal_grounds_from_failing_test_when_flow_unmatched(tmp_path):
     assert "# Flow: deadbeef00" in body  # original provenance preserved through the heal
 
 
+
+
+# -- backend surfaces: EVENT (message contracts) + DATA (db schema) ---------------------
+
+
+def _event_inv() -> CoverageInventory:
+    return CoverageInventory(
+        system_name="Orders Events", base_url="kafka://broker", source="asyncapi",
+        elements=[
+            Element(kind="topic", name="orderCreated", location="orders.created", method="receive",
+                    description="Order placed.", priority="high"),
+            Element(kind="event_schema", name="OrderCreated", location="orders.created",
+                    description="Order created event.", priority="high",
+                    inputs=[InputField(name="orderId", type="string", required=True, where="message")],
+                    json_schema={"type": "object", "required": ["orderId"],
+                                 "properties": {"orderId": {"type": "string"}}}),
+        ],
+        suggested_journeys=[
+            Journey(name="OrderCreated conforms", description="validate a sample payload",
+                    priority="high", steps=[JourneyStep(action="build a sample and validate it")],
+                    elements=["OrderCreated"]),
+        ],
+    )
+
+
+def _db_inv() -> CoverageInventory:
+    return CoverageInventory(
+        system_name="Shop DB", base_url="sqlite:///shop.db", source="db_schema",
+        elements=[
+            Element(kind="table", name="users", location="users", description="Users table.",
+                    priority="high",
+                    inputs=[InputField(name="id", type="INTEGER", required=True, where="column"),
+                            InputField(name="email", type="TEXT", required=True, where="column")],
+                    preconditions=["PRIMARY KEY (id)", "UNIQUE (email)"]),
+        ],
+        suggested_journeys=[
+            Journey(name="users constraints", description="assert the schema/constraints",
+                    priority="high", steps=[JourneyStep(action="introspect the users table")],
+                    elements=["users"]),
+        ],
+    )
+
+
+def test_build_prompt_event_grounds_on_message_schema():
+    inv = _event_inv()
+    prompt = build_prompt(inv, inv.suggested_journeys[0])
+    assert "Journey type: EVENT" in prompt
+    assert "message_schema" in prompt and "OrderCreated" in prompt
+
+
+def test_build_prompt_data_grounds_on_db_inspector():
+    inv = _db_inv()
+    prompt = build_prompt(inv, inv.suggested_journeys[0])
+    assert "Journey type: DATA" in prompt
+    assert "db_inspector" in prompt and "users" in prompt
+
+
+def test_lint_event_requires_schema_validation():
+    bad = "def test_x():\n    assert True\n"
+    assert any("schema" in f for f in lint_draft(bad, web=False, api=False, event=True))
+    good = (
+        "import jsonschema\n"
+        "def test_x(message_schema):\n"
+        "    jsonschema.validate(instance={}, schema=message_schema('A'))\n"
+    )
+    assert lint_draft(good, web=False, api=False, event=True) == []
+
+
+def test_lint_data_requires_db_inspector():
+    bad = "def test_x():\n    assert True\n"
+    assert any("db_inspector" in f for f in lint_draft(bad, web=False, api=False, data=True))
+    good = "def test_x(db_inspector):\n    assert 'users' in db_inspector.get_table_names()\n"
+    assert lint_draft(good, web=False, api=False, data=True) == []
+
+
+def test_is_destructive_ignores_backend_journey_prose():
+    # EVENT/DATA journeys are NOT judged destructive from prose — a contract check is routinely
+    # *described* with write words ("producers emit valid payloads", "rejects inserts") yet the
+    # draft is read-only. Destructiveness for these is decided from generated code, not prose.
+    ev = _event_inv()
+    assert is_destructive(ev, ev.suggested_journeys[0]) is False
+    emit_prose = Journey(name="conformance", description="ensure producers emit valid payloads",
+                         priority="high", steps=[JourneyStep(action="publish a valid OrderCreated")],
+                         elements=["orderCreated"])
+    assert is_destructive(ev, emit_prose) is False  # prose alone never flags a topic
+
+    db = _db_inv()
+    assert is_destructive(db, db.suggested_journeys[0]) is False
+    insert_prose = Journey(name="constraints", description="verify the table rejects bad inserts",
+                           priority="high", steps=[JourneyStep(action="insert is rejected")],
+                           elements=["users"])
+    assert is_destructive(db, insert_prose) is False
+
+
+def test_mutates_backend_flags_real_writes_only():
+    from aitomation.write.generator import _mutates_backend
+
+    # read-only contract code → not a mutation
+    assert _mutates_backend(
+        "def t(message_schema):\n    import jsonschema\n"
+        "    jsonschema.validate(instance={}, schema=message_schema('A'))\n"
+    ) is False
+    assert _mutates_backend(
+        "def t(db_inspector):\n    assert 'users' in db_inspector.get_table_names()\n"
+    ) is False
+    # actual DML / commit → mutation
+    assert _mutates_backend("conn.execute(text('INSERT INTO users VALUES (1)'))\nconn.commit()") is True
+    # actual broker publish → mutation
+    assert _mutates_backend("producer.produce('orders', value=b'x')") is True
+
+
+def test_system_prompt_documents_event_and_data():
+    sp = build_system_prompt()
+    assert "EVENT journeys" in sp and "DATA journeys" in sp
+    assert "message_schema" in sp and "db_inspector" in sp
+
+
+async def test_draft_event_contract_runs_by_default(tmp_path):
+    code = (
+        "import jsonschema\n\n"
+        "def test_order_created_conforms(message_schema):\n"
+        "    schema = message_schema('OrderCreated')\n"
+        "    jsonschema.validate(instance={'orderId': 'ord_1'}, schema=schema)\n"
+    )
+    report = await draft_tests(_event_inv(), _FakeProvider(code=code), into=tmp_path)
+    assert len(report.written) == 1 and not report.quarantined
+    r = report.written[0]
+    assert r.destructive is False
+    src = r.path.read_text()
+    assert "pytestmark = pytest.mark.skip" not in src and "message_schema" in src
+
+
+async def test_draft_data_contract_runs_by_default(tmp_path):
+    code = (
+        "def test_users_schema(db_inspector):\n"
+        "    assert 'users' in db_inspector.get_table_names()\n"
+    )
+    report = await draft_tests(_db_inv(), _FakeProvider(code=code), into=tmp_path)
+    assert len(report.written) == 1 and not report.quarantined
+    assert report.written[0].destructive is False

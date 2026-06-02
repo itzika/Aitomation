@@ -28,7 +28,14 @@ def test_cli_version():
 def test_discover_subcommands_present():
     result = runner.invoke(app, ["discover", "--help"])
     assert result.exit_code == 0
-    assert "openapi" in result.output and "crawl" in result.output
+    for sub in ("openapi", "crawl", "asyncapi", "registry", "db"):
+        assert sub in result.output
+
+
+def test_discover_db_help_documents_both_modes():
+    result = runner.invoke(app, ["discover", "db", "--help"])
+    assert result.exit_code == 0
+    assert "DDL" in result.output or ".sql" in result.output
 
 
 def test_write_help_has_force_flag():

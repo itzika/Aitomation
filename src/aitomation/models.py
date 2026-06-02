@@ -10,14 +10,24 @@ double as the schema the model is steered by.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-ElementKind = Literal["page", "form", "flow", "endpoint", "auth"]
+# Web/API surface: page/form/flow/endpoint/auth. Backend surface added later:
+# topic/event_schema (message queues), table/migration (databases).
+ElementKind = Literal[
+    "page", "form", "flow", "endpoint", "auth",
+    "topic", "event_schema", "table", "migration",
+]
 Priority = Literal["high", "medium", "low"]
-InputWhere = Literal["query", "path", "header", "cookie", "body", "form", "unknown"]
-DiscoverySource = Literal["openapi", "crawl", "postman"]
+# `column` = a database column; `message` = a field of an event/message payload.
+InputWhere = Literal[
+    "query", "path", "header", "cookie", "body", "form", "column", "message", "unknown"
+]
+DiscoverySource = Literal[
+    "openapi", "crawl", "postman", "asyncapi", "schema_registry", "db_schema"
+]
 
 
 class InputField(BaseModel):
@@ -59,6 +69,13 @@ class TestableElement(BaseModel):
     preconditions: list[str] = Field(
         default_factory=list,
         description="What must be true first, e.g. 'requires authenticated session'.",
+    )
+    json_schema: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Raw JSON Schema for the message payload — populated for `event_schema` elements so the "
+            "scaffold can emit it and contract tests can validate a sample against it. Unused otherwise."
+        ),
     )
     priority: Priority = Field(description="Testing priority relative to the rest of the system.")
 

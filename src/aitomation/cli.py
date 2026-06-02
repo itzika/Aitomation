@@ -19,8 +19,11 @@ from rich.table import Table
 from . import __version__
 from .config import ConfigError, LLMConfig
 from .diff import InventoryDiff, diff_inventories
+from .discover.asyncapi import discover_asyncapi
 from .discover.crawl import discover_crawl
+from .discover.database import discover_db
 from .discover.openapi import discover_openapi
+from .discover.registry import discover_registry
 from .models import CoverageInventory
 from .naming import PROJECTS_ROOT, slugify
 from .providers import PydanticAIProvider
@@ -209,6 +212,74 @@ def discover_openapi_cmd(
     llm = _resolve_provider(provider, model, recorder)
     try:
         _finish(discover_openapi(source, llm), out)
+    finally:
+        _report_usage(recorder)
+
+
+@discover_app.command("asyncapi")
+def discover_asyncapi_cmd(
+    source: str = typer.Argument(..., help="AsyncAPI spec (2.x or 3.x): URL or local path."),
+    out: Path = typer.Option(
+        Path("inventory.json"), "--out", "-o", help="Where to write the inventory JSON."
+    ),
+    provider: Optional[str] = typer.Option(None, "--provider", "-p", help=_PROVIDER_HELP),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override model name."),
+    usage_log: Path = typer.Option(
+        Path(DEFAULT_LOG), "--usage-log", envvar="AITOMATION_USAGE_LOG", help="JSONL usage log path."
+    ),
+) -> None:
+    """Discover a CoverageInventory from an AsyncAPI spec (channels → topics, messages → schemas)."""
+    console.print(f"[dim]Discovering[/] [bold]{source}[/] [dim]…[/]")
+    recorder = UsageRecorder(app=source, log_path=usage_log)
+    llm = _resolve_provider(provider, model, recorder)
+    try:
+        _finish(discover_asyncapi(source, llm), out)
+    finally:
+        _report_usage(recorder)
+
+
+@discover_app.command("registry")
+def discover_registry_cmd(
+    source: str = typer.Argument(..., help="Schema registry base URL (Confluent-compatible REST)."),
+    out: Path = typer.Option(
+        Path("inventory.json"), "--out", "-o", help="Where to write the inventory JSON."
+    ),
+    provider: Optional[str] = typer.Option(None, "--provider", "-p", help=_PROVIDER_HELP),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override model name."),
+    usage_log: Path = typer.Option(
+        Path(DEFAULT_LOG), "--usage-log", envvar="AITOMATION_USAGE_LOG", help="JSONL usage log path."
+    ),
+) -> None:
+    """Discover a CoverageInventory from a live schema registry (subjects → event schemas)."""
+    console.print(f"[dim]Discovering[/] [bold]{source}[/] [dim]…[/]")
+    recorder = UsageRecorder(app=source, log_path=usage_log)
+    llm = _resolve_provider(provider, model, recorder)
+    try:
+        _finish(discover_registry(source, llm), out)
+    finally:
+        _report_usage(recorder)
+
+
+@discover_app.command("db")
+def discover_db_cmd(
+    source: str = typer.Argument(
+        ..., help="DB connection URL (postgresql://…, sqlite:///…) or a .sql DDL file."
+    ),
+    out: Path = typer.Option(
+        Path("inventory.json"), "--out", "-o", help="Where to write the inventory JSON."
+    ),
+    provider: Optional[str] = typer.Option(None, "--provider", "-p", help=_PROVIDER_HELP),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override model name."),
+    usage_log: Path = typer.Option(
+        Path(DEFAULT_LOG), "--usage-log", envvar="AITOMATION_USAGE_LOG", help="JSONL usage log path."
+    ),
+) -> None:
+    """Discover a CoverageInventory from a database (live reflection or a .sql DDL file)."""
+    console.print(f"[dim]Discovering[/] [bold]{source}[/] [dim]…[/]")
+    recorder = UsageRecorder(app=source, log_path=usage_log)
+    llm = _resolve_provider(provider, model, recorder)
+    try:
+        _finish(discover_db(source, llm), out)
     finally:
         _report_usage(recorder)
 

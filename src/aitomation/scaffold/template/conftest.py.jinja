@@ -99,3 +99,50 @@ def api_request_context(playwright, auth_headers: dict):
     yield request_context
     request_context.dispose()
 {% endif %}
+{% if has_db %}
+
+@pytest.fixture(scope="session")
+def db_engine():
+    # Database contract tests reflect the live schema. Set DATABASE_URL (e.g.
+    # postgresql://user:pass@host/db); without it these tests skip rather than error.
+    from sqlalchemy import create_engine
+
+    url = os.environ.get("DATABASE_URL", "")
+    if not url:
+        pytest.skip("DATABASE_URL not set — set it to run database contract tests.")
+    engine = create_engine(url)
+    yield engine
+    engine.dispose()
+
+
+@pytest.fixture(scope="session")
+def db_inspector(db_engine):
+    # SQLAlchemy Inspector — read-only catalog introspection (tables, columns, constraints).
+    from sqlalchemy import inspect
+
+    return inspect(db_engine)
+{% endif %}
+{% if has_events %}
+import json
+from pathlib import Path
+
+
+@pytest.fixture(scope="session")
+def message_schemas() -> dict:
+    # Message payload JSON Schemas discovered at scaffold time (schemas.json).
+    path = Path(__file__).parent / "schemas.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+@pytest.fixture(scope="session")
+def message_schema(message_schemas):
+    # Look up one discovered schema by element name, for jsonschema.validate(sample, schema).
+    def _get(name: str) -> dict:
+        if name not in message_schemas:
+            raise KeyError(
+                f"No discovered schema named {name!r}; available: {sorted(message_schemas)}"
+            )
+        return message_schemas[name]
+
+    return _get
+{% endif %}

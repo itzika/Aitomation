@@ -9,6 +9,7 @@ land in visible, timestamped per-run directories under each tested app.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -48,8 +49,11 @@ from textual.widgets._header import HeaderTitle
 
 from ..config import Backend, ConfigError, LLMConfig
 from ..diff import diff_inventories
+from ..discover.asyncapi import discover_asyncapi
 from ..discover.crawl import discover_crawl
+from ..discover.database import discover_db
 from ..discover.openapi import discover_openapi
+from ..discover.registry import discover_registry
 from ..providers import LLMProvider, PydanticAIProvider
 from ..scaffold import scaffold_project
 from ..scaffold.generator import _func_name
@@ -123,6 +127,10 @@ _STATUS_STYLE = {
     "skipped · destructive": "#ffd400",
     "needs review": "#ffd400",
 }
+
+# Latest per-file run outcomes, persisted next to pytest-output.txt in a run dir so the
+# Tests-tab status survives a TUI restart instead of resetting to static file markers.
+_STATUS_FILE = ".aito-status.json"
 
 # Outcome precedence when a file has several tests: failure/error > pass > skip.
 _OUTCOME_RANK = {"skipped": 0, "xfail": 0, "xpass": 0, "passed": 1, "failed": 2, "error": 2}
@@ -293,6 +301,18 @@ class EditorScreen(ModalScreen[list[str] | None]):
         self.dismiss(None)
 
 
+# The sources the wizard offers, in display order: (key, radio label, origin placeholder).
+# `key` is what run_discover dispatches on. The web/API surfaces lead; the backend surfaces
+# (events, databases) follow. The placeholder retitles the single location field per source.
+_WIZARD_SOURCES: tuple[tuple[str, str, str], ...] = (
+    ("openapi", "OpenAPI / Swagger spec  (file or URL)", "https://api.example.com/openapi.json"),
+    ("crawl", "Crawl a running web app  (URL)", "https://app.example.com"),
+    ("asyncapi", "AsyncAPI spec  (file or URL)", "./asyncapi.yaml  or  https://…/asyncapi.json"),
+    ("registry", "Schema registry  (live URL)", "http://localhost:8081"),
+    ("db", "Database  (connection URL or .sql DDL)", "postgresql://user@host/db   or   ./schema.sql"),
+)
+
+
 class WizardScreen(ModalScreen[dict | None]):
     """Guided onboarding for a new system — replaces having to know commands."""
 
@@ -307,10 +327,10 @@ class WizardScreen(ModalScreen[dict | None]):
             yield Label("◢ discover a new system", id="wizard-title")
             yield Label("source", classes="wizard-label")
             with RadioSet(id="source"):
-                yield RadioButton("OpenAPI / Swagger spec  (file or URL)", value=True)
-                yield RadioButton("Crawl a running web app  (URL)")
-            yield Label("location (spec path/URL, or app URL)", classes="wizard-label")
-            yield Input(placeholder="https://api.example.com/openapi.json", id="origin")
+                for i, (_key, label, _ph) in enumerate(_WIZARD_SOURCES):
+                    yield RadioButton(label, value=(i == 0))
+            yield Label("location", classes="wizard-label")
+            yield Input(placeholder=_WIZARD_SOURCES[0][2], id="origin")
             yield Label("model (blank = configured default)", classes="wizard-label")
             yield Input(value=self._default_model, placeholder="e.g. qwen3-max", id="model")
             with Horizontal(id="wizard-buttons"):
@@ -319,6 +339,13 @@ class WizardScreen(ModalScreen[dict | None]):
 
     def on_mount(self) -> None:
         self.query_one("#origin", Input).focus()
+
+    def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
+        # Retitle the location field's placeholder to match the chosen source (URL vs file vs
+        # connection string), so it's obvious what to paste.
+        idx = event.radio_set.pressed_index
+        if 0 <= idx < len(_WIZARD_SOURCES):
+            self.query_one("#origin", Input).placeholder = _WIZARD_SOURCES[idx][2]
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "cancel":
@@ -332,9 +359,10 @@ class WizardScreen(ModalScreen[dict | None]):
     def _submit(self) -> None:
         origin = self.query_one("#origin", Input).value.strip()
         if not origin:
-            self.notify("Enter a spec path/URL or app URL.", severity="warning")
+            self.notify("Enter a spec/app URL, connection string, or file path.", severity="warning")
             return
-        source = "openapi" if self.query_one("#source", RadioSet).pressed_index == 0 else "crawl"
+        idx = self.query_one("#source", RadioSet).pressed_index
+        source = _WIZARD_SOURCES[idx][0] if 0 <= idx < len(_WIZARD_SOURCES) else "openapi"
         model = self.query_one("#model", Input).value.strip() or None
         self.dismiss({"source": source, "origin": origin, "model": model})
 
@@ -723,8 +751,40 @@ class AitomationApp(App):
             return
         self.current = self._records[idx]
         self.current_inv = self.workspace.load_inventory(self.current.slug)
-        self._test_outcomes = {}  # run outcomes are per-system; don't bleed across selections
+        # Rehydrate the latest run's per-file outcomes from disk so the Tests-tab status
+        # survives a restart / re-selection (per-system; never bled across selections).
+        run = self.current.latest_run
+        self._test_outcomes = self._load_outcomes(Path(run)) if run else {}
         self._populate_tabs()
+
+    def _load_outcomes(self, run: Path) -> dict[str, str]:
+        """The latest run's per-file pass/fail, read back from disk so the Tests-tab status
+        SURVIVES a restart instead of resetting to static file markers. Prefers the small
+        status file we write after each run/fix; falls back to parsing the persisted pytest
+        output (so runs recorded before this existed still light up). This is the last run's
+        view kept next to pytest-output.txt — not a cross-run results store."""
+        status = run / _STATUS_FILE
+        if status.is_file():
+            try:
+                data = json.loads(status.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return {str(k): str(v) for k, v in data.items()}
+            except (json.JSONDecodeError, OSError):
+                pass
+        out = run / "pytest-output.txt"
+        if out.is_file():
+            try:
+                return _parse_pytest_outcomes(out.read_text(encoding="utf-8").splitlines())
+            except OSError:
+                pass
+        return {}
+
+    def _save_outcomes(self, run: Path) -> None:
+        """Persist the current per-file outcomes next to pytest-output.txt (see _load_outcomes)."""
+        try:
+            (run / _STATUS_FILE).write_text(json.dumps(self._test_outcomes), encoding="utf-8")
+        except OSError:
+            pass
 
     def _current_index(self) -> int:
         for i, r in enumerate(self.workspace.list_systems()):
@@ -1144,10 +1204,19 @@ class AitomationApp(App):
                 provider = self._llm
         self.recorder.app = origin
         self._begin_progress(None, f"discovering {escape(origin)} …")
+        # `source` is a wizard key on a new discover, but re-discover passes the saved
+        # inventory's DiscoverySource ('schema_registry'/'db_schema'); normalise both forms.
+        src = {"schema_registry": "registry", "db_schema": "db"}.get(source, source)
         try:
-            if source == "openapi":
+            if src == "openapi":
                 inv = await discover_openapi(origin, provider)
-            else:
+            elif src == "asyncapi":
+                inv = await discover_asyncapi(origin, provider)
+            elif src == "registry":
+                inv = await discover_registry(origin, provider)
+            elif src == "db":
+                inv = await discover_db(origin, provider)
+            else:  # crawl
                 inv = await discover_crawl(
                     origin, provider, on_page=lambda p: self._log(f"crawled {escape(p.url)}")
                 )
@@ -1215,8 +1284,10 @@ class AitomationApp(App):
         self.notify(f"pytest: {counts}", severity="information" if rc == 0 else "warning", timeout=8)
         self._last_run_failed = rc != 0
         self.refresh_bindings()  # reveal/hide [f] in the footer
-        # Reflect THIS run's per-test results in the Tests tab status column.
+        # Reflect THIS run's per-test results in the Tests tab status column, and persist them
+        # so the status survives a restart (rehydrated on select via _load_outcomes).
         self._test_outcomes = _parse_pytest_outcomes(captured)
+        self._save_outcomes(run)
         self._render_tests()
         self.push_screen(
             ResultsScreen(f"pytest — {counts}", "\n".join(tail), has_failures=rc != 0), self._on_results
@@ -1296,6 +1367,7 @@ class AitomationApp(App):
             self._test_outcomes[r.path.name] = "passed"
         for r in report.still_failing:
             self._test_outcomes[r.path.name] = "failed"
+        self._save_outcomes(dest)  # so the heal result survives a restart too
         self._render_tests()  # refresh per-file status (failing drafts now flagged)
         self.query_one("#tabs", TabbedContent).active = "tab-tests"
 

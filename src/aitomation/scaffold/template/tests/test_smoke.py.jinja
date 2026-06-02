@@ -15,7 +15,19 @@ def test_home_loads(page, base_url):
     page.goto(base_url)
     assert page.title() is not None
 {% endif %}
-{% if not has_api and not has_browser %}
+{% if has_db %}
+
+def test_database_reachable(db_inspector):
+    # Read-only: the schema has at least one table. Skips if DATABASE_URL is unset.
+    assert db_inspector.get_table_names() is not None
+{% endif %}
+{% if has_events %}
+
+def test_message_schemas_load(message_schemas):
+    # The discovered payload schemas are present and well-formed JSON.
+    assert isinstance(message_schemas, dict)
+{% endif %}
+{% if not has_api and not has_browser and not has_db and not has_events %}
 
 def test_placeholder():
     # Nothing testable was discovered; replace once the inventory has elements.

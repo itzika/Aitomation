@@ -5,7 +5,7 @@ Human-authoritative: review everything before relying on it. Nothing here was au
 
 - Base URL: `{{ base_url }}`
 - Auth strategy: `{{ auth_strategy }}`
-- Discovered: {{ pages | length }} page(s), {{ endpoints | length }} endpoint(s), {{ journeys | length }} suggested journey(s)
+- Discovered: {{ pages | length }} page(s), {{ endpoints | length }} endpoint(s){% if has_db %}, {{ tables | length }} table(s){% endif %}{% if has_events %}, {{ topics | length }} topic(s), {{ event_schemas | length }} event schema(s){% endif %}, {{ journeys | length }} suggested journey(s)
 
 ## Run
 
@@ -20,11 +20,23 @@ Auth is `{{ auth_strategy }}` — set the relevant env vars (see `conftest.py`).
 
 ## Layout
 
-- `conftest.py` — fixtures (base_url, auth, API request context)
+- `conftest.py` — fixtures (base_url, auth{% if has_api %}, API request context{% endif %}{% if has_db %}, db_inspector{% endif %}{% if has_events %}, message_schema{% endif %})
 {% if has_browser %}- `pages.py` — page objects seeded from discovered pages
 {% endif %}{% if has_api %}- `api_client.py` — client seeded from discovered endpoints
+{% endif %}{% if has_events %}- `schemas.json` — discovered message payload JSON Schemas (used by `message_schema`)
 {% endif %}- `tests/` — smoke tests (draft journey tests come from the Write stage)
 - `reporting.py` — reporting hook interface (triage is a separate product)
+{% if has_db or has_events %}
+
+## Backend contract tests
+
+Drafts for backend surfaces are **contract-level and read-only** by design (no broker spin-up,
+no async round-trip):
+{% if has_db %}- **Database** — `db_inspector` reflects the live schema; tests assert tables, columns,
+  and constraints. Set `DATABASE_URL` (tests skip without it).
+{% endif %}{% if has_events %}- **Events** — `message_schema("<Name>")` returns a discovered JSON Schema; tests
+  `jsonschema.validate(...)` a sample payload against it. No running broker required.
+{% endif %}{% endif %}
 
 ## Suggested journeys to cover (from discovery)
 {% for j in journeys %}
