@@ -609,3 +609,18 @@ async def test_tui_dispatches_new_discovery_sources(tmp_path):
         # re-discover passes the inventory's DiscoverySource — both forms must route correctly
         assert (await _run_one_discover(app, pilot, "schema_registry", "http://r2", "discover_registry"))["origin"] == "http://r2"
         assert (await _run_one_discover(app, pilot, "db_schema", "y.sql", "discover_db"))["origin"] == "y.sql"
+
+
+async def test_header_title_shimmers(tmp_path):
+    # Cosmetic: the header title animates a light-sweep. Verify it still renders the real
+    # title text and that the sweep phase advances on tick.
+    from aitomation.tui.app import ShimmerTitle
+
+    app = _app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        title = app.query_one(ShimmerTitle)
+        assert "aitomation" in title.render().plain  # per-char styling, same text
+        before = title._phase
+        title._advance()
+        assert title._phase != before  # the comet moved

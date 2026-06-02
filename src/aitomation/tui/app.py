@@ -45,7 +45,7 @@ from textual.widgets import (
     TabbedContent,
     TabPane,
 )
-from textual.widgets._header import HeaderTitle
+from textual.widgets._header import HeaderClock, HeaderClockSpace, HeaderIcon, HeaderTitle
 
 from ..config import Backend, ConfigError, LLMConfig
 from ..diff import diff_inventories
@@ -201,9 +201,58 @@ def _resolve_editor(cli_candidates: tuple[str, ...], app_prefixes: tuple[str, ..
     return [cmd] if cmd else None
 
 
+# A neon "light sweep" that travels left-to-right across the title letters: a bright comet
+# head trailing two fading cells, over a dim base, with a short beat between sweeps. Single-hue
+# (dim cyan -> white) so it reads as light gliding over chrome rather than a colour clash.
+_SHIMMER_TIERS = ("#155e6b", "#22d3ee", "#7eecff", "#ffffff")  # base, tail, mid, comet head
+_SHIMMER_GAP = 8  # cells of "pause" appended to the sweep so it pulses instead of running solid
+
+
+class ShimmerTitle(HeaderTitle):
+    """The header title, animated. Subclasses HeaderTitle so the stock Header still wires it up
+    (and `query_one(HeaderTitle)` keeps finding it); we just take over how it draws and run a
+    cheap ~12fps timer that sweeps a highlight across the letters. Purely cosmetic."""
+
+    def on_mount(self) -> None:
+        self._phase = 0
+        self._timer = self.set_interval(0.08, self._advance)
+
+    def _advance(self) -> None:
+        title = self.app.title or ""
+        self._phase = (self._phase + 1) % max(len(title) + _SHIMMER_GAP, 1)
+        self.refresh()
+
+    def render(self) -> Text:
+        title = self.app.title or ""
+        head = getattr(self, "_phase", 0)
+        text = Text(justify="center", no_wrap=True)
+        for i, ch in enumerate(title):
+            offset = head - i  # comet head at i == head, fading tail to its left
+            tier = _SHIMMER_TIERS[3] if offset == 0 else (
+                _SHIMMER_TIERS[2] if offset == 1 else
+                _SHIMMER_TIERS[1] if offset == 2 else _SHIMMER_TIERS[0]
+            )
+            text.append(ch, style=f"bold {tier}" if offset == 0 else tier)
+        sub = self.app.sub_title or ""
+        if sub:
+            text.append("   ")
+            text.append(sub, style="dim #7a8a99")
+        return text
+
+
 class ModelHeader(Header):
     """The app header, but its title is clickable to switch the active provider/model.
     (The default Header click just expands a clock row we don't use, so we repurpose it.)"""
+
+    def compose(self) -> ComposeResult:
+        # Mirror Header.compose, swapping in the animated title.
+        yield HeaderIcon().data_bind(Header.icon)
+        yield ShimmerTitle()
+        yield (
+            HeaderClock().data_bind(Header.time_format)
+            if self._show_clock
+            else HeaderClockSpace()
+        )
 
     def _on_mount(self, event) -> None:
         super()._on_mount(event)
