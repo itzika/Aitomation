@@ -622,7 +622,7 @@ async def test_header_banner_animates_folds_and_pauses(tmp_path):
         banner = app.query_one(MatrixBanner)
 
         # the title is rendered (over the rain) and the animation advances on tick
-        assert "aitomation" in banner.render().plain
+        assert "aitomation" in banner.render().plain.lower()
         before = banner._phase
         banner._tick()
         assert banner._phase != before

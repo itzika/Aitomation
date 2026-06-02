@@ -61,23 +61,28 @@ from ..write import draft_tests, enable_drafts, heal_failing_tests, select_journ
 from ..naming import PROJECTS_ROOT
 from .workspace import SystemRecord, Workspace, slugify
 
+# Restrained dark: ONE cyan accent on cool neutral darks. The old neon triad (cyan + magenta +
+# green) is gone — magenta retired to a muted slate, the accent unified to cyan, and the loud
+# green/yellow/red semantics desaturated so only genuine signals (errors, the accent) draw the
+# eye. The animated header banner stays the single bold flourish; the panel borders are a quiet
+# neutral (a literal in CSS, since custom theme vars aren't available when App.CSS is parsed).
 CYBERPUNK = Theme(
     name="cyberpunk",
-    primary="#22d3ee",     # cyan
-    secondary="#f637ec",   # magenta
-    accent="#39ff14",      # neon green
+    primary="#22d3ee",     # cyan — the single accent (focus, modal borders, matches the banner)
+    secondary="#5b6b7f",   # muted slate (was magenta)
+    accent="#22d3ee",      # keep the accent in the cyan family (was neon green)
     foreground="#cde7f0",
     background="#080b12",
     surface="#0e1320",
     panel="#141b2d",
-    success="#39ff14",
-    warning="#ffd400",
-    error="#ff2e63",
+    success="#56d39a",     # soft green (was neon #56d39a)
+    warning="#e0b341",     # muted amber (was neon #e0b341)
+    error="#f2647b",       # rose (was neon #f2647b)
     dark=True,
     variables={
         "block-cursor-foreground": "#080b12",
         "block-cursor-background": "#22d3ee",
-        "footer-key-foreground": "#39ff14",
+        "footer-key-foreground": "#22d3ee",  # was neon green
     },
 )
 
@@ -119,13 +124,13 @@ _BACKENDS: tuple[str, ...] = get_args(Backend)
 
 # Colour the Tests-tab status so pass/fail/skip read at a glance.
 _STATUS_STYLE = {
-    "passed": "#39ff14",
-    "ok": "#39ff14",
-    "failed": "#ff2e63",
-    "failing · see notes": "#ff2e63",
-    "skipped": "#ffd400",
-    "skipped · destructive": "#ffd400",
-    "needs review": "#ffd400",
+    "passed": "#56d39a",
+    "ok": "#56d39a",
+    "failed": "#f2647b",
+    "failing · see notes": "#f2647b",
+    "skipped": "#e0b341",
+    "skipped · destructive": "#e0b341",
+    "needs review": "#e0b341",
 }
 
 # Latest per-file run outcomes, persisted next to pytest-output.txt in a run dir so the
@@ -645,15 +650,15 @@ class AitomationApp(App):
     CSS = """
     Screen { layers: base; }
     #main { height: 1fr; }
-    #systems { width: 40; border-right: solid $primary; }
+    #systems { width: 40; border-right: solid #243240; }
     #tabs { width: 1fr; }
-    #log { height: 9; border-top: solid $primary; background: $surface; padding: 0 1; }
+    #log { height: 9; border-top: solid #243240; background: $surface; padding: 0 1; }
     #log.-hidden { display: none; }
     #statusbar { height: 1; background: $panel; }
     #progress { width: 32; display: none; padding: 0 1; }
     #status { width: 1fr; padding: 0 1; color: $accent; }
     DataTable { height: 1fr; background: $surface; }
-    .detail { height: auto; max-height: 14; padding: 1; border-top: solid $primary; }
+    .detail { height: auto; max-height: 14; padding: 1; border-top: solid #243240; }
     HeaderTitle:hover { background: $foreground 10%; }
     #wizard { width: 64; height: auto; padding: 1 2; background: $surface; border: round $primary; }
     #wizard-title { color: $accent; text-style: bold; width: 100%; content-align: center middle; padding-bottom: 1; }
@@ -794,7 +799,7 @@ class AitomationApp(App):
             self.sub_title = f"{self._config.backend}:{self._config.model}"
         except ConfigError:
             self.sub_title = "no LLM key"
-            self._log("[#ffd400]no LLM configured[/] — browse/scaffold work; discover/write need a key")
+            self._log("[#e0b341]no LLM configured[/] — browse/scaffold work; discover/write need a key")
 
     def _provider_ready(self) -> bool:
         if self._llm is None:
@@ -828,7 +833,7 @@ class AitomationApp(App):
         self._config = cfg
         self._llm = PydanticAIProvider(cfg, self.recorder)
         self.sub_title = f"{cfg.backend}:{cfg.model}"
-        self._log(f"[#39ff14]model[/] → {cfg.backend}:{cfg.model} [dim](output: {cfg.output_mode})[/]")
+        self._log(f"[#56d39a]model[/] → {cfg.backend}:{cfg.model} [dim](output: {cfg.output_mode})[/]")
 
     # -- log + status -------------------------------------------------------------------
 
@@ -993,10 +998,10 @@ class AitomationApp(App):
     @staticmethod
     def _next_hint(rec: SystemRecord) -> str:
         if not rec.scaffolded:
-            return "[#39ff14]▸ next[/] press [b]s[/] to scaffold a runnable project"
+            return "[#56d39a]▸ next[/] press [b]s[/] to scaffold a runnable project"
         if not rec.drafted:
-            return "[#39ff14]▸ next[/] press [b]w[/] to draft tests, one per flow"
-        return "[#39ff14]▸ next[/] review drafts in the [b]Tests[/] tab · [b]r[/] to re-discover"
+            return "[#56d39a]▸ next[/] press [b]w[/] to draft tests, one per flow"
+        return "[#56d39a]▸ next[/] review drafts in the [b]Tests[/] tab · [b]r[/] to re-discover"
 
     def _cost_for(self, name: str) -> dict:
         recs = [r for r in load_records(self.recorder.log_path) if r.get("app") == name]
@@ -1038,7 +1043,7 @@ class AitomationApp(App):
         body.append(f"flows     {len(inv.suggested_journeys)}\n")
         cost = self._cost_for(inv.system_name)
         if cost["any"]:
-            body.append("\ncost\n", style="bold #f637ec")
+            body.append("\ncost\n", style="bold #7f8ea3")
             body.append(f"  discover  ~{cost['discover']:,} tok\n")
             if cost["n_tests"]:
                 body.append(
@@ -1048,13 +1053,13 @@ class AitomationApp(App):
         # action bar — green ✓ once a stage is done (kept above the fold)
         body.append("\nactions   ")
         body.append("[ s ] scaffold ", style="dim")
-        body.append("✓" if rec.scaffolded else "·", style="#39ff14" if rec.scaffolded else "#39455c")
+        body.append("✓" if rec.scaffolded else "·", style="#56d39a" if rec.scaffolded else "#39455c")
         body.append("   [ w ] write tests ", style="dim")
-        body.append("✓" if rec.drafted else "·", style="#39ff14" if rec.drafted else "#39455c")
+        body.append("✓" if rec.drafted else "·", style="#56d39a" if rec.drafted else "#39455c")
         body.append("   [ r ] re-discover\n", style="dim")
 
         if rec.scaffolded and rec.latest_run:
-            body.append("\nrun       ", style="bold #f637ec")
+            body.append("\nrun       ", style="bold #7f8ea3")
             body.append("[ t ] run pytest here   [ o ] open in editor\n", style="dim")
             body.append(f"  cd {rec.latest_run}\n", style="dim")
             body.append("  uv sync && uv run playwright install chromium && uv run pytest -ra\n", style="dim")
@@ -1184,7 +1189,7 @@ class AitomationApp(App):
         table.add_section()
         table.add_row("TOTAL", str(total["calls"]), f"{total['input_tokens']:,}",
                       f"{total['output_tokens']:,}", f"{total['total_tokens']:,}",
-                      f"{total['duration_s']}", style="bold #39ff14")
+                      f"{total['duration_s']}", style="bold #56d39a")
         self.query_one("#usage", Static).update(table)
 
     # -- actions ------------------------------------------------------------------------
@@ -1218,11 +1223,11 @@ class AitomationApp(App):
         try:
             scaffold_project(self.current_inv, run)
         except Exception as e:  # noqa: BLE001
-            self._log(f"[#ff2e63]scaffold failed[/] {escape(str(e))}")
+            self._log(f"[#f2647b]scaffold failed[/] {escape(str(e))}")
             self.notify(f"Scaffold failed: {e}", severity="error")
             return
         self.workspace.set_flags(self.current.slug, scaffolded=True, latest_run=str(run))
-        self._log(f"[#39ff14]scaffolded[/] → {run} · next: write tests ([b]w[/])")
+        self._log(f"[#56d39a]scaffolded[/] → {run} · next: write tests ([b]w[/])")
         self._refresh_systems(select=self._current_index())
         self.notify("Scaffolded. Press w to draft tests.")
 
@@ -1314,7 +1319,7 @@ class AitomationApp(App):
         results = enable_drafts(Path(self.current.latest_run), targets=[sel[2].stem])
         if results and results[0].enabled:
             self._log(
-                f"[#39ff14]enabled[/] {name} — skip lifted · "
+                f"[#56d39a]enabled[/] {name} — skip lifted · "
                 "verify teardown before running ([b]t[/])"
             )
             self._render_tests()  # status flips skipped → ok
@@ -1359,12 +1364,12 @@ class AitomationApp(App):
         self._log(f"[#22d3ee]changes since last discover[/] — {d.summary()}")
         if d.added_journeys:
             names = ", ".join(j.name for j in d.added_journeys)
-            self._log(f"  [#39ff14]new flow(s)[/]: {names} — press [b]w[/] to draft them")
+            self._log(f"  [#56d39a]new flow(s)[/]: {names} — press [b]w[/] to draft them")
         if rec.latest_run and d.affected_journeys:
             tests = Path(rec.latest_run) / "tests"
             stale = [j.name for j in d.affected_journeys if (tests / f"test_{_func_name(j.name)}.py").exists()]
             if stale:
-                self._log("  [#ffd400]⚠ existing test(s) may be stale[/]: " + ", ".join(stale))
+                self._log("  [#e0b341]⚠ existing test(s) may be stale[/]: " + ", ".join(stale))
         self.notify(f"Changes since last discover — {d.summary()}", timeout=8)
 
     # -- workers ------------------------------------------------------------------------
@@ -1398,7 +1403,7 @@ class AitomationApp(App):
                     origin, provider, on_page=lambda p: self._log(f"crawled {escape(p.url)}")
                 )
         except Exception as e:  # noqa: BLE001
-            self._log(f"[#ff2e63]discovery failed[/] {escape(str(e))}")
+            self._log(f"[#f2647b]discovery failed[/] {escape(str(e))}")
             self.notify(f"Discovery failed: {type(e).__name__}: {e}", severity="error", timeout=8)
             return
         finally:
@@ -1409,7 +1414,7 @@ class AitomationApp(App):
         rec = self.workspace.save(inv, origin=origin)
         self.recorder.app = inv.system_name
         self.recorder.flush()
-        self._log(f"[#39ff14]discovered[/] {inv.system_name} — {len(inv.elements)} elements, "
+        self._log(f"[#56d39a]discovered[/] {inv.system_name} — {len(inv.elements)} elements, "
                   f"{len(inv.suggested_journeys)} flows · next: scaffold ([b]s[/])")
         if baseline is not None:
             self._report_inventory_diff(baseline, inv, rec)
@@ -1456,7 +1461,7 @@ class AitomationApp(App):
              if " in " in ln and any(w in ln for w in ("passed", "failed", "error"))),
             f"exit {rc}",
         )
-        verdict = "[#39ff14]✓[/]" if rc == 0 else "[#ff2e63]✗[/]"
+        verdict = "[#56d39a]✓[/]" if rc == 0 else "[#f2647b]✗[/]"
         self._log(f"{verdict} pytest: {counts}  [dim](full output → {run}/pytest-output.txt)[/]")
         self.notify(f"pytest: {counts}", severity="information" if rc == 0 else "warning", timeout=8)
         self._last_run_failed = rc != 0
@@ -1492,7 +1497,7 @@ class AitomationApp(App):
             # Non-destructive: only new flows are drafted; existing tests are kept.
             report = await draft_tests(self.current_inv, self._llm, into=dest, on_draft=progress)
         except Exception as e:  # noqa: BLE001
-            self._log(f"[#ff2e63]write failed[/] {escape(str(e))}")
+            self._log(f"[#f2647b]write failed[/] {escape(str(e))}")
             self.notify(f"Write failed: {type(e).__name__}: {e}", severity="error", timeout=8)
             return
         finally:
@@ -1500,7 +1505,7 @@ class AitomationApp(App):
         self.workspace.set_flags(self.current.slug, drafted=True)
         self.recorder.flush()
         kept = f" [dim]· {len(report.skipped)} existing kept[/]" if report.skipped else ""
-        self._log(f"[#39ff14]drafts written[/]{kept} — review in the Tests tab")
+        self._log(f"[#56d39a]drafts written[/]{kept} — review in the Tests tab")
         self._refresh_systems(select=self._current_index())
         self.query_one("#tabs", TabbedContent).active = "tab-tests"
 
@@ -1512,13 +1517,13 @@ class AitomationApp(App):
         self._begin_progress(None, "fixing failing tests …")
 
         def progress(r) -> None:
-            verb = "[#39ff14]fixed[/]" if r.fixed else f"[#ff2e63]still failing[/] [dim]({r.reason})[/]"
+            verb = "[#56d39a]fixed[/]" if r.fixed else f"[#f2647b]still failing[/] [dim]({r.reason})[/]"
             self._log(f"{verb} {r.path.name}")
 
         try:
             report = await heal_failing_tests(inv, self._llm, into=dest, on_heal=progress)
         except Exception as e:  # noqa: BLE001
-            self._log(f"[#ff2e63]fix failed[/] {escape(str(e))}")
+            self._log(f"[#f2647b]fix failed[/] {escape(str(e))}")
             self.notify(f"Fix failed: {type(e).__name__}: {e}", severity="error", timeout=8)
             return
         finally:
@@ -1529,11 +1534,11 @@ class AitomationApp(App):
         self._last_run_failed = n_left > 0  # keep [f] available while failures remain
         self.refresh_bindings()
         if not report.fixed and not report.still_failing:
-            self._log("[#39ff14]fix[/] nothing to fix — all drafts pass")
+            self._log("[#56d39a]fix[/] nothing to fix — all drafts pass")
             self.notify("Nothing to fix — all drafts pass.")
         else:
-            verdict = "[#39ff14]✓[/]" if n_left == 0 else "[#ffd400]∼[/]"
-            self._log(f"{verdict} fix: [#39ff14]{n_fixed} fixed[/] · {n_left} still failing")
+            verdict = "[#56d39a]✓[/]" if n_left == 0 else "[#e0b341]∼[/]"
+            self._log(f"{verdict} fix: [#56d39a]{n_fixed} fixed[/] · {n_left} still failing")
             self.notify(
                 f"Fixed {n_fixed}; {n_left} still failing.",
                 severity="information" if n_left == 0 else "warning", timeout=8,
