@@ -51,6 +51,20 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 from ..config import Backend, ConfigError, LLMConfig
+from ..credentials import (
+    DEFAULT_PROFILE,
+    PROFILES,
+    CredentialError,
+    clear_credential,
+    clear_profile,
+    credential_status,
+    get_store,
+    load_credentials,
+    needs_credentials,
+    profile_fields,
+    required_credentials,
+    set_credential,
+)
 from ..diff import diff_inventories
 from ..discover.asyncapi import discover_asyncapi
 from ..discover.crawl import discover_crawl
@@ -63,7 +77,7 @@ from ..scaffold import scaffold_project
 from ..scaffold.generator import _func_name
 from ..telemetry import DEFAULT_LOG, UsageRecorder, aggregate, load_records
 from ..workspace import SystemRecord, Workspace, slugify
-from ..write import draft_tests, enable_drafts, heal_failing_tests, select_journeys
+from ..write import draft_login, draft_tests, enable_drafts, heal_failing_tests, select_journeys
 
 # Restrained dark: ONE cyan accent on cool neutral darks. The old neon triad (cyan + magenta +
 # green) is gone — magenta retired to a muted slate, the accent unified to cyan, and the loud
@@ -104,6 +118,8 @@ A system moves through three stages, shown as dots in the library: \
   t   run the scaffolded tests here (pytest decides pass/fail, never the AI)
   f   fix: self-heal the tests that just failed (one corrective retry each)
   e   enable the selected skipped (destructive) draft — review + add teardown first
+  c   credentials — securely store the system's auth per profile (dev/stage/prod);
+      runs inject them into pytest's env, never to disk or a model
   o   open the run folder — pick VS Code / PyCharm / Cursor / Antigravity
   m   change the provider/model — apply to the default or one stage (discover/write/fix)
   d   delete the selected system
@@ -844,6 +860,118 @@ class WizardScreen(ModalScreen[dict | None]):
         self.dismiss(None)
 
 
+class CredentialsScreen(ModalScreen[dict | None]):
+    """Securely type in and store the credentials a system needs to be tested — per deployment
+    profile (dev/stage/prod). Secret fields render masked and are never prefilled or revealed;
+    a stored secret shows as '•••• stored' and is only overwritten when you type a new value.
+    BASE_URL is a non-secret per-profile override of the target host. Writes go straight to the
+    secret backend (OS keychain or encrypted file) via the passed store; nothing is written to
+    the repo or an LLM. Blanking a non-secret field clears that override."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, slug: str, inv, profile: str, store) -> None:
+        super().__init__()
+        self._slug = slug
+        self._inv = inv
+        self._profile = profile if profile in PROFILES else DEFAULT_PROFILE
+        self._store = store
+        self._fields = profile_fields(inv)
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="creds-picker"):
+            yield Label("◢ credentials — system under test", id="creds-title")
+            yield Label(
+                f"stored in {self._store.label} · per profile · never committed or sent to a model",
+                id="creds-sub",
+            )
+            yield Label("profile", classes="wizard-label")
+            with RadioSet(id="creds-profile"):
+                for p in PROFILES:
+                    yield RadioButton(p, value=(p == self._profile))
+            for f in self._fields:
+                hint = " (secret)" if f.secret else ""
+                yield Label(f"{f.label}{hint}", classes="wizard-label")
+                yield Input(
+                    placeholder=f.help,
+                    password=f.secret,
+                    id=f"cred-{f.env}",
+                )
+            with Horizontal(id="creds-buttons"):
+                yield Button("Save", variant="primary", id="save")
+                yield Button("Clear profile", id="clear")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self._load_profile(self._profile)
+        # Focus the first credential field (after BASE_URL), or BASE_URL if it's all there is.
+        first = self._fields[1].env if len(self._fields) > 1 else self._fields[0].env
+        self.query_one(f"#cred-{first}", Input).focus()
+
+    def _selected_profile(self) -> str:
+        idx = self.query_one("#creds-profile", RadioSet).pressed_index
+        return PROFILES[idx] if 0 <= idx < len(PROFILES) else self._profile
+
+    def _load_profile(self, profile: str) -> None:
+        """Reflect what's stored for `profile`: prefill non-secret values, and show secret
+        fields as '•••• stored' (never the value) when set. Clears typed input on switch."""
+        status = credential_status(self._slug, profile, self._inv, store=self._store)
+        loaded = load_credentials(self._slug, profile, self._inv, store=self._store)
+        for f in self._fields:
+            inp = self.query_one(f"#cred-{f.env}", Input)
+            if f.secret:
+                inp.value = ""
+                inp.placeholder = "•••• stored — type to replace" if status[f.env] else f.help
+            else:
+                inp.value = loaded.get(f.env, "")
+                inp.placeholder = self._inv.base_url if f.env == "BASE_URL" else f.help
+
+    def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
+        if event.radio_set.id == "creds-profile":
+            self._load_profile(self._selected_profile())
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+        elif event.button.id == "clear":
+            self._clear()
+        else:
+            self._save()
+
+    def _save(self) -> None:
+        profile = self._selected_profile()
+        saved = 0
+        try:
+            for f in self._fields:
+                val = self.query_one(f"#cred-{f.env}", Input).value.strip()
+                if f.secret:
+                    if val:  # blank leaves a stored secret untouched (don't wipe on re-open)
+                        set_credential(self._slug, profile, f.env, val, store=self._store)
+                        saved += 1
+                elif val:
+                    set_credential(self._slug, profile, f.env, val, store=self._store)
+                    saved += 1
+                else:
+                    clear_credential(self._slug, profile, f.env, store=self._store)
+        except CredentialError as e:
+            self.notify(f"Couldn't save: {e}", severity="error", timeout=8)
+            return
+        self.dismiss({"profile": profile, "saved": saved})
+
+    def _clear(self) -> None:
+        profile = self._selected_profile()
+        try:
+            n = clear_profile(self._slug, profile, self._inv, store=self._store)
+        except CredentialError as e:
+            self.notify(f"Couldn't clear: {e}", severity="error", timeout=8)
+            return
+        self._load_profile(profile)
+        self.dismiss({"profile": profile, "cleared": n})
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class HelpScreen(ModalScreen):
     """Keybinding + workflow reference. Any key closes it."""
 
@@ -940,6 +1068,7 @@ class WorkbenchCommands(Provider):
             ("Run tests for current system", app.action_run_tests),
             ("Fix failing tests (self-heal)", app.action_fix_failing),
             ("Enable selected (skipped) draft", app.action_enable_test),
+            ("Edit credentials for current system", app.action_credentials),
             ("Open run folder in editor", app.action_open_editor),
             ("Change provider / model", app.action_choose_model),
             ("Delete current system", app.action_delete),
@@ -979,6 +1108,11 @@ class AitomationApp(App):
     #model-list { height: 8; margin-top: 1; border: round #243240; background: $surface; }
     #model-buttons { height: auto; padding-top: 1; align: center middle; }
     #model-buttons Button { margin: 0 1; }
+    #creds-picker { width: 66; height: auto; max-height: 95%; padding: 1 2; background: $surface; border: round $primary; }
+    #creds-title { color: $accent; text-style: bold; width: 100%; content-align: center middle; }
+    #creds-sub { color: #7f8ea3; width: 100%; content-align: center middle; padding-bottom: 1; }
+    #creds-buttons { height: auto; padding-top: 1; align: center middle; }
+    #creds-buttons Button { margin: 0 1; }
     #editor-picker { width: 48; height: auto; padding: 1 2; background: $surface; border: round $primary; }
     #editor-title { color: $accent; text-style: bold; width: 100%; content-align: center middle; padding-bottom: 1; }
     #editor-picker Button { width: 100%; margin: 0 0 1 0; }
@@ -1004,6 +1138,7 @@ class AitomationApp(App):
         Binding("t", "run_tests", "Run"),
         Binding("f", "fix_failing", "Fix"),
         Binding("e", "enable_test", "Enable"),
+        Binding("c", "credentials", "Creds"),
         Binding("o", "open_editor", "Open"),
         Binding("d", "delete", "Delete"),
         Binding("l", "toggle_log", "Log"),
@@ -1254,6 +1389,9 @@ class AitomationApp(App):
             except Exception:
                 return False
             return bool(sel and "skip" in sel[1])
+        # Hide [c] unless the current system actually has discovered auth to enter.
+        if action == "credentials":
+            return bool(self.current_inv is not None and needs_credentials(self.current_inv))
         return True
 
     # -- systems library ----------------------------------------------------------------
@@ -1402,6 +1540,31 @@ class AitomationApp(App):
             t.append("  ")
         return t
 
+    def _append_creds_line(self, body: Text, rec: SystemRecord, inv) -> None:
+        """The Overview credential callout: the active profile, one ●/○ dot per required field
+        (set vs not), the affordance to edit, and where secrets are stored. Never shows values."""
+        profile = rec.profile or DEFAULT_PROFILE
+        try:
+            store = get_store()
+            status = credential_status(rec.slug, profile, inv, store=store)
+            backend = store.label
+        except CredentialError:
+            status, backend = {}, "unavailable"
+        req = required_credentials(inv)
+        body.append("creds     ")
+        body.append(f"[{profile}]  ", style="#22d3ee")
+        for f in req:
+            on = status.get(f.env, False)
+            body.append("● " if on else "○ ", style="#56d39a" if on else "#e0b341")
+            body.append(f"{f.label}  ", style="#cde7f0" if on else "#7f8ea3")
+        body.append("\n          ")
+        all_set = bool(req) and all(status.get(f.env, False) for f in req)
+        body.append(
+            "[ c ] edit credentials" if all_set else "[ c ] add credentials",
+            style="dim" if all_set else "#56d39a",
+        )
+        body.append(f"   ·  stored in {backend}\n", style="dim")
+
     def _render_overview(self) -> None:
         inv, rec = self.current_inv, self.current
         if inv is None or rec is None:
@@ -1419,6 +1582,8 @@ class AitomationApp(App):
         body.append(f"{inv.base_url}\n", style="dim")
         body.append(f"\nsource    {inv.source}\n")
         body.append(f"auth      {auth}\n")
+        if needs_credentials(inv):
+            self._append_creds_line(body, rec, inv)
         models_line = self._stage_models_line()
         if models_line is not None:
             body.append("models    ")
@@ -1731,7 +1896,24 @@ class AitomationApp(App):
         if self.current is None:
             self.notify("Select a system first.", severity="warning")
             return
-        if self._provider_ready():
+        if not self._provider_ready():
+            return
+        # Re-discovery re-runs the model and rewrites the inventory — confirm first so a stray
+        # keypress/click can't kick off a billable run (existing scaffold + reviewed drafts are
+        # preserved; the diff reports what changed).
+        self.push_screen(
+            ConfirmScreen(
+                f"Re-discover '{self.current.name}'?\n\nThis re-runs the model against "
+                f"{self.current.origin} and updates the inventory. Your scaffold and reviewed "
+                "drafts are kept — the diff reports what changed.",
+                confirm_label="Re-discover",
+                confirm_variant="primary",
+            ),
+            self._on_rediscover_confirm,
+        )
+
+    def _on_rediscover_confirm(self, ok: bool | None) -> None:
+        if ok and self.current is not None and self._provider_ready():
             self.run_discover(self.current.source, self.current.origin, self._model_for("discover"))
 
     def action_scaffold(self) -> None:
@@ -1784,6 +1966,65 @@ class AitomationApp(App):
         self.workspace.delete(self.current.slug)
         self._log(f"deleted {name}")
         self._refresh_systems(select=0)
+
+    def action_credentials(self) -> None:
+        """Open the secure credential editor for the current system (its auth, per profile)."""
+        if self.current is None or self.current_inv is None:
+            self.notify("Select a system first.", severity="warning")
+            return
+        if not needs_credentials(self.current_inv):
+            self.notify("No auth was discovered for this system.", severity="information")
+            return
+        try:
+            store = get_store()
+        except CredentialError as e:
+            self.notify(f"Credential store unavailable: {e}", severity="error", timeout=8)
+            return
+        self.push_screen(
+            CredentialsScreen(
+                self.current.slug, self.current_inv, self.current.profile or DEFAULT_PROFILE, store
+            ),
+            self._on_credentials,
+        )
+
+    def _on_credentials(self, result: dict | None) -> None:
+        if not result or self.current is None:
+            return
+        profile = result.get("profile", DEFAULT_PROFILE)
+        # The profile chosen in the editor becomes the system's active one (what runs use).
+        self.current = self.workspace.set_profile(self.current.slug, profile)
+        if "cleared" in result:
+            self._log(f"[#e0b341]credentials[/] cleared {result['cleared']} value(s) for {profile}")
+        else:
+            self._log(
+                f"[#56d39a]credentials[/] saved {result.get('saved', 0)} value(s) · profile {profile}"
+            )
+        self._render_overview()
+
+    def _creds_env(self) -> dict[str, str]:
+        """Stored credentials for the current system's active profile, for overlaying onto a
+        pytest subprocess env. Logs only HOW MANY were loaded — never the values. {} when the
+        system has no auth, none are stored, or the store is unreadable."""
+        if (
+            self.current is None
+            or self.current_inv is None
+            or not needs_credentials(self.current_inv)
+        ):
+            return {}
+        profile = self.current.profile or DEFAULT_PROFILE
+        try:
+            creds = load_credentials(self.current.slug, profile, self.current_inv)
+        except CredentialError as e:
+            self._log(f"[#e0b341]credentials[/] {escape(str(e))}")
+            return {}
+        if creds:
+            self._log(
+                f"[#22d3ee]profile {profile}[/] · {len(creds)} credential(s) loaded "
+                "[dim](kept out of logs)[/]"
+            )
+        else:
+            self._log(f"[dim]profile {profile} · no stored credentials (press [b]c[/] to add)[/]")
+        return creds
 
     def action_run_tests(self) -> None:
         if self.current is None or not self.current.scaffolded or not self.current.latest_run:
@@ -1972,6 +2213,9 @@ class AitomationApp(App):
         )
         self._begin_progress(None, f"pytest in {run.name} …")
         env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+        # Overlay the system-under-test credentials for the active profile (process env only —
+        # never written to disk or echoed). A BASE_URL set per profile retargets the run.
+        env.update(self._creds_env())
         captured: list[str] = []
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -2061,6 +2305,17 @@ class AitomationApp(App):
             return
         finally:
             self._end_progress()
+        # Session-auth scaffold → author login.py from the discovered sign-in form (no-op for
+        # other auth kinds). A failed generation keeps the runnable scaffold stub.
+        try:
+            login = await draft_login(self.current_inv, self._provider_for("write"), into=dest)
+        except Exception as e:
+            login = None
+            self._log(f"[#e0b341]login draft skipped[/] {escape(str(e))}")
+        if login is not None and login.authored:
+            self._log("[#56d39a]authored login.py[/] from the discovered form [dim](review it)[/]")
+        elif login is not None and login.reason and login.reason != "already authored":
+            self._log(f"[#e0b341]login.py kept as stub[/] [dim]({login.reason})[/]")
         self.workspace.set_flags(self.current.slug, drafted=True)
         self.recorder.flush()
         kept = f" [dim]· {len(report.skipped)} existing kept[/]" if report.skipped else ""
@@ -2087,7 +2342,11 @@ class AitomationApp(App):
 
         try:
             report = await heal_failing_tests(
-                inv, self._provider_for("fix"), into=dest, on_heal=progress
+                inv,
+                self._provider_for("fix"),
+                into=dest,
+                on_heal=progress,
+                env_extra=self._creds_env(),
             )
         except Exception as e:
             self._log(f"[#f2647b]fix failed[/] {escape(str(e))}")

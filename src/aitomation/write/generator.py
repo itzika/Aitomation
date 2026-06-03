@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from ..diff import journey_fingerprint
 from ..models import CoverageInventory, Journey, TestableElement
 from ..providers import LLMProvider
-from ..scaffold.generator import _class_name, _func_name
+from ..scaffold.generator import _class_name, _func_name, login_form
 
 MAX_JOURNEYS = 8
 
@@ -654,9 +654,13 @@ def _corrective(findings: list[str]) -> str:
     )
 
 
-def run_test_file(test_file_path: Path, cwd: Path) -> tuple[int, str]:
+def run_test_file(
+    test_file_path: Path, cwd: Path, *, env_extra: dict[str, str] | None = None
+) -> tuple[int, str]:
     """Runs a single test file using pytest and captures the output.
-    Returns (exit_code, output)."""
+    Returns (exit_code, output). `env_extra` overlays the subprocess env — used to inject the
+    system-under-test credentials for the active profile so a verify/heal run can actually
+    reach a protected system (secrets stay in the child env; never written to disk)."""
     import os
     import shutil
     import subprocess
@@ -670,6 +674,8 @@ def run_test_file(test_file_path: Path, cwd: Path) -> tuple[int, str]:
     # inheriting whatever venv launched the toolkit — otherwise pytest runs without the
     # scaffold's pytest-playwright/sqlalchemy and every draft errors at collection.
     env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    if env_extra:
+        env.update(env_extra)
 
     try:
         res = subprocess.run(
@@ -986,6 +992,136 @@ async def draft_tests(
 
 
 # --------------------------------------------------------------------------------------
+# Login: author the session login flow (login.py) from the discovered sign-in form
+# --------------------------------------------------------------------------------------
+#
+# A session-auth scaffold imports `perform_login` from login.py to log in once and reuse the
+# storage_state across tests. Scaffold lays down a best-effort stub; this replaces it with a
+# flow authored from the form's REAL discovered locators — reading AUTH_USER / AUTH_PASS from
+# the env, never hard-coding secrets. Deterministic conftest stays untouched; only login.py is
+# (re)written, and a broken generation leaves the runnable stub in place.
+
+
+_LOGIN_SYSTEM = "\n".join(
+    [
+        "You are a senior test-automation engineer writing a Playwright (sync API) LOGIN HELPER.",
+        "A human will review it before it is trusted.",
+        "",
+        "Output a COMPLETE, importable Python module with exactly this entry point:",
+        "    def perform_login(page, base_url): ...",
+        "It signs a user in so the test session starts authenticated. Rules (follow exactly):",
+        "- Read credentials from the environment, never hard-code them:",
+        '    user = os.environ.get("AUTH_USER", "");  password = os.environ.get("AUTH_PASS", "")',
+        "- Navigate to the login page with page.goto(base_url.rstrip('/') + '<path>'), then fill the",
+        "  username and password fields and submit. Use the EXACT locators given in the context",
+        "  (prefer get_by_label / get_by_role); do NOT invent fields.",
+        "- Wait for the post-login navigation with page.wait_for_load_state('networkidle') or",
+        "  page.wait_for_url(...). NEVER use a hard sleep (time.sleep / wait_for_timeout).",
+        "- Do NOT assert pass/fail and do NOT return anything — just perform the login.",
+        "- Return ONLY the module source in `code`; no prose outside it.",
+    ]
+)
+
+
+class LoginDraft(BaseModel):
+    """A generated login.py module."""
+
+    code: str = Field(description="Complete login.py: imports + def perform_login(page, base_url).")
+    review_notes: str = Field(
+        description="What a reviewer should verify (selectors, post-login wait)."
+    )
+
+
+@dataclass(slots=True)
+class LoginResult:
+    path: Path
+    authored: bool
+    reason: str = ""
+
+
+def _login_prompt(inv: CoverageInventory, el: TestableElement) -> str:
+    fields = (
+        "\n".join(
+            f"  - {i.name} (type: {i.type}, where: {i.where})"
+            + (f"  locator: page.{i.locator}" if i.locator else "")
+            for i in el.inputs
+        )
+        or "  (no fields captured — use get_by_label('Username') / get_by_label('Password'))"
+    )
+    return (
+        f"System: {inv.system_name}\n"
+        f"Base URL: {inv.base_url}\n"
+        f"Login form at path: {el.location}\n"
+        f"Discovered form fields:\n{fields}\n\n"
+        "Write login.py with `def perform_login(page, base_url):` that logs in using these fields."
+    )
+
+
+def _lint_login(code: str) -> list[str]:
+    findings: list[str] = []
+    if "def perform_login" not in code:
+        findings.append("must define perform_login(page, base_url)")
+    if "AUTH_USER" not in code or "AUTH_PASS" not in code:
+        findings.append("must read AUTH_USER and AUTH_PASS from os.environ (never hard-code creds)")
+    if any(b in code for b in _BANNED):
+        findings.append("uses a hard sleep — wait with wait_for_load_state / wait_for_url instead")
+    if "page." not in code:
+        findings.append("must drive the page (page.goto, fills, submit)")
+    return findings
+
+
+def _login_header(inv: CoverageInventory, draft: LoginDraft) -> str:
+    notes = draft.review_notes.replace("\n", " ").strip()
+    return (
+        "# AI-AUTHORED login flow — review before trusting. Generated by Aitomation Write.\n"
+        f"# System: {inv.system_name} ({inv.source})\n"
+        f"# Reviewer notes: {notes or '(none)'}\n"
+        "# Credentials come from AUTH_USER / AUTH_PASS in the environment.\n\n\n"
+    )
+
+
+async def draft_login(
+    inv: CoverageInventory, provider: LLMProvider, *, into: Path | str, force: bool = False
+) -> LoginResult | None:
+    """Author login.py for a session-auth scaffold from the discovered sign-in form.
+
+    Returns None when it doesn't apply (not a session scaffold, or no login form was
+    discovered). Otherwise authors `perform_login` from the form's real locators, lint-checked
+    (defines perform_login, reads creds from the env, no hard sleeps) with one corrective
+    retry. A draft that won't lint/compile is rejected and the runnable scaffold stub kept, so
+    this can never strand the scaffold with a broken login.py. Skips a login.py Write already
+    authored unless `force`."""
+    into = Path(into)
+    login_py = into / "login.py"
+    if not login_py.exists():
+        return None  # only session scaffolds carry login.py
+    el = login_form(inv)
+    if el is None:
+        return None  # session inferred but no concrete form to author from — keep the stub
+    if not force and "Aitomation Write" in login_py.read_text(encoding="utf-8"):
+        return LoginResult(login_py, False, "already authored")
+
+    prompt = _login_prompt(inv, el)
+    draft = await provider.generate_structured(
+        prompt, LoginDraft, system=_LOGIN_SYSTEM, label="write:login"
+    )
+    findings = _lint_login(draft.code)
+    if findings:
+        draft = await provider.generate_structured(
+            prompt + _corrective(findings), LoginDraft, system=_LOGIN_SYSTEM, label="write:login"
+        )
+        findings = _lint_login(draft.code)
+
+    code = draft.code.strip() + "\n"
+    if findings or not _compiles(code, "login.py"):
+        reason = "; ".join(findings) or "generated login.py does not compile"
+        return LoginResult(login_py, False, reason)
+
+    login_py.write_text(_login_header(inv, draft) + code, encoding="utf-8")
+    return LoginResult(login_py, True)
+
+
+# --------------------------------------------------------------------------------------
 # Fix: self-heal tests that fail when actually run (the interactive twin of --verify)
 # --------------------------------------------------------------------------------------
 
@@ -1048,6 +1184,7 @@ async def heal_failing_tests(
     into: Path | str,
     max_journeys: int = MAX_JOURNEYS,
     on_heal: Callable[[HealResult], None] | None = None,
+    env_extra: dict[str, str] | None = None,
 ) -> HealReport:
     """Run each drafted test in `into`/tests once and self-heal the ones that fail.
 
@@ -1072,7 +1209,7 @@ async def heal_failing_tests(
         src = path.read_text(encoding="utf-8")
         if "mark.skip" in src:
             continue  # destructive / explicitly skipped — not meant to run unattended
-        rc, output = await asyncio.to_thread(run_test_file, path, into)
+        rc, output = await asyncio.to_thread(run_test_file, path, into, env_extra=env_extra)
         if rc == 0:
             report.passed.append(path)
             continue
@@ -1141,7 +1278,7 @@ async def heal_failing_tests(
         # Preserve the original provenance header (incl. the # Flow stamp); swap only the code.
         orig_header, _ = _split_header(src)
         path.write_text(orig_header + body, encoding="utf-8")
-        rc2, output2 = await asyncio.to_thread(run_test_file, path, into)
+        rc2, output2 = await asyncio.to_thread(run_test_file, path, into, env_extra=env_extra)
         if rc2 == 0:
             result = HealResult(journey.name, path, fixed=True)
             report.fixed.append(result)

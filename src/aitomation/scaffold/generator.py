@@ -73,6 +73,67 @@ def _scheme_rank(s: AuthScheme) -> int:
     return 4
 
 
+def login_form(inv: CoverageInventory) -> Any:
+    """The discovered sign-in form element — the one carrying a password field — or None.
+    Used to seed login.py (and let Write author the real login flow from its real locators)."""
+    for e in inv.elements:
+        if e.kind in ("form", "page", "auth") and any(
+            (i.type or "").lower() == "password" for i in e.inputs
+        ):
+            return e
+    return None
+
+
+def _login_context(inv: CoverageInventory) -> dict[str, str] | None:
+    """Path + observed field locators for the discovered login form, for the login.py stub.
+    None when no login form was captured (e.g. session inferred from a spec) — the stub then
+    falls back to generic label locators a human/Write fills in."""
+    el = login_form(inv)
+    if el is None:
+        return None
+    pw = next(i for i in el.inputs if (i.type or "").lower() == "password")
+    user = next(
+        (
+            i
+            for i in el.inputs
+            if (i.type or "").lower() != "password" and i.where in ("form", "unknown") and i.locator
+        ),
+        None,
+    )
+    loc = el.location or "/login"
+    return {
+        "login_path": loc if loc.startswith("/") else "/" + loc,
+        "user_locator": user.locator if user and user.locator else 'get_by_label("Username")',
+        "pass_locator": pw.locator if pw.locator else 'get_by_label("Password")',
+    }
+
+
+def _render_login_py(project_name: str, login: dict[str, str] | None) -> str:
+    """A best-effort, deterministic login.py for a session-auth scaffold: it reads AUTH_USER /
+    AUTH_PASS from the env and drives the discovered sign-in form. `aitomation write` refines
+    `perform_login` from the real form; until then this is a runnable starting point."""
+    path = login["login_path"] if login else "/login"
+    user_loc = login["user_locator"] if login else 'get_by_label("Username")'
+    pass_loc = login["pass_locator"] if login else 'get_by_label("Password")'
+    return (
+        f'"""Login flow for {project_name}.\n\n'
+        "perform_login() drives the discovered sign-in form so the suite starts authenticated. It\n"
+        "is called ONCE per session by the storage_state fixture in conftest.py. Credentials come\n"
+        "from the environment (AUTH_USER / AUTH_PASS) — never hard-coded. Best-effort stub from the\n"
+        "discovered form; refine with `aitomation write` (which authors it) or by hand.\n"
+        '"""\n\n'
+        "import os\n\n\n"
+        "def perform_login(page, base_url):\n"
+        '    user = os.environ.get("AUTH_USER", "")\n'
+        '    password = os.environ.get("AUTH_PASS", "")\n'
+        f'    page.goto(base_url.rstrip("/") + "{path}")\n'
+        f"    page.{user_loc}.fill(user)\n"
+        f"    page.{pass_loc}.fill(password)\n"
+        '    page.get_by_role("button", name="Sign in").click()  # TODO: confirm the submit control\n'
+        '    page.wait_for_load_state("networkidle")\n'
+    )
+
+
 def _auth_context(inv: CoverageInventory) -> dict[str, Any]:  # type: ignore[name-defined]
     """Resolve the auth fixture shape from structured schemes (preferred) or the free-text
     strategy (fallback). Returns auth_kind + the header/param details the template needs."""
@@ -254,4 +315,15 @@ def scaffold_project(
     schemas = _event_schemas_json(inventory)
     if schemas:
         (dest / "schemas.json").write_text(json.dumps(schemas, indent=2), encoding="utf-8")
+
+    # Session auth → emit login.py (the storage_state fixture imports perform_login from it).
+    # Written here, not as a template, so it's only present for session scaffolds and Write can
+    # re-author it cleanly. Don't clobber a login.py a previous Write already authored.
+    if context["auth_kind"] == "session":
+        login_py = dest / "login.py"
+        if not (login_py.exists() and "Aitomation Write" in login_py.read_text(encoding="utf-8")):
+            login_py.write_text(
+                _render_login_py(context["project_name"], _login_context(inventory)),
+                encoding="utf-8",
+            )
     return dest
