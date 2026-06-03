@@ -18,18 +18,30 @@ def _api_inventory(auth: str | None = "bearer") -> CoverageInventory:
         auth_strategy=auth,
         elements=[
             Element(
-                kind="endpoint", name="create_thing", location="/things", method="POST",
-                description='Create a "thing"', priority="high",
+                kind="endpoint",
+                name="create_thing",
+                location="/things",
+                method="POST",
+                description='Create a "thing"',
+                priority="high",
             ),
             Element(
-                kind="endpoint", name="get_thing", location="/things/{id}", method="GET",
-                description="Read", priority="medium",
+                kind="endpoint",
+                name="get_thing",
+                location="/things/{id}",
+                method="GET",
+                description="Read",
+                priority="medium",
             ),
-            Element(kind="auth", name="bearer auth", location="/login", description="x", priority="high"),
+            Element(
+                kind="auth", name="bearer auth", location="/login", description="x", priority="high"
+            ),
         ],
         suggested_journeys=[
             Journey(
-                name="Create then read", description="round trip", priority="high",
+                name="Create then read",
+                description="round trip",
+                priority="high",
                 steps=[JourneyStep(action="create"), JourneyStep(action="read")],
             )
         ],
@@ -45,7 +57,11 @@ def _web_inventory() -> CoverageInventory:
         elements=[
             Element(kind="page", name="Home", location="/", description="Home", priority="medium"),
             Element(
-                kind="form", name="Login Form", location="/login", description="Login", priority="high",
+                kind="form",
+                name="Login Form",
+                location="/login",
+                description="Login",
+                priority="high",
                 inputs=[
                     InputField(name="username", where="form", required=True),
                     InputField(name="password", where="form", required=True, type="password"),
@@ -60,9 +76,16 @@ def _web_inventory() -> CoverageInventory:
 
 @pytest.mark.parametrize(
     "raw, expected",
-    [("oauth2", "bearer"), ("apiKey", "bearer"), ("Bearer token", "bearer"),
-     ("basic", "basic"), ("session", "session"), ("cookie-based", "session"),
-     (None, "none"), ("none", "none")],
+    [
+        ("oauth2", "bearer"),
+        ("apiKey", "bearer"),
+        ("Bearer token", "bearer"),
+        ("basic", "basic"),
+        ("session", "session"),
+        ("cookie-based", "session"),
+        (None, "none"),
+        ("none", "none"),
+    ],
 )
 def test_normalize_auth(raw, expected):
     assert _normalize_auth(raw) == expected
@@ -200,11 +223,26 @@ def test_scaffold_web_project(tmp_path):
 
 def test_page_object_uses_observed_locator_and_first(tmp_path):
     inv = CoverageInventory(
-        system_name="Shop", base_url="https://shop.demo", source="crawl",
+        system_name="Shop",
+        base_url="https://shop.demo",
+        source="crawl",
         elements=[
-            Element(kind="form", name="login_form", location="/login", description="login", priority="high",
-                    inputs=[InputField(name="email", where="form", required=True,
-                                       locator='get_by_placeholder("Email Address")', unique=False)]),
+            Element(
+                kind="form",
+                name="login_form",
+                location="/login",
+                description="login",
+                priority="high",
+                inputs=[
+                    InputField(
+                        name="email",
+                        where="form",
+                        required=True,
+                        locator='get_by_placeholder("Email Address")',
+                        unique=False,
+                    )
+                ],
+            ),
         ],
     )
     dest = scaffold_project(inv, tmp_path / "e2e")
@@ -239,14 +277,26 @@ def _event_inventory() -> CoverageInventory:
         base_url="kafka://broker",
         source="asyncapi",
         elements=[
-            Element(kind="topic", name="orderCreated", location="orders.created", method="receive",
-                    description="Order placed.", priority="high"),
             Element(
-                kind="event_schema", name="OrderCreated", location="orders.created",
-                description="Order created event.", priority="high",
+                kind="topic",
+                name="orderCreated",
+                location="orders.created",
+                method="receive",
+                description="Order placed.",
+                priority="high",
+            ),
+            Element(
+                kind="event_schema",
+                name="OrderCreated",
+                location="orders.created",
+                description="Order created event.",
+                priority="high",
                 inputs=[InputField(name="orderId", type="string", required=True, where="message")],
-                json_schema={"type": "object", "required": ["orderId"],
-                             "properties": {"orderId": {"type": "string"}}},
+                json_schema={
+                    "type": "object",
+                    "required": ["orderId"],
+                    "properties": {"orderId": {"type": "string"}},
+                },
             ),
         ],
     )
@@ -259,7 +309,10 @@ def _db_inventory() -> CoverageInventory:
         source="db_schema",
         elements=[
             Element(
-                kind="table", name="users", location="users", description="Users table.",
+                kind="table",
+                name="users",
+                location="users",
+                description="Users table.",
                 priority="high",
                 inputs=[
                     InputField(name="id", type="INTEGER", required=True, where="column"),
@@ -295,6 +348,7 @@ def test_scaffold_event_project(tmp_path):
 
     # the discovered schema is emitted verbatim for jsonschema.validate(...)
     import json
+
     schemas = json.loads((dest / "schemas.json").read_text())
     assert schemas["OrderCreated"]["required"] == ["orderId"]
 

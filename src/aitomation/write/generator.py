@@ -77,9 +77,7 @@ class WriteReport:
 def select_journeys(inv: CoverageInventory, max_journeys: int = MAX_JOURNEYS) -> list[Journey]:
     """Pick journeys to draft, highest priority first. Falls back to synthesising
     one-step journeys from high-priority elements if the inventory suggested none."""
-    journeys = sorted(
-        inv.suggested_journeys, key=lambda j: _PRIORITY_ORDER.get(j.priority, 3)
-    )
+    journeys = sorted(inv.suggested_journeys, key=lambda j: _PRIORITY_ORDER.get(j.priority, 3))
     if journeys:
         return journeys[:max_journeys]
 
@@ -104,8 +102,20 @@ def _elements_for(inv: CoverageInventory, journey: Journey) -> list[TestableElem
 
 
 _SUBMIT_VERBS = (
-    "submit", "register", "sign up", "signup", "create", "send", "place order",
-    "checkout", "subscribe", "log in", "login", "update", "delete", "post ",
+    "submit",
+    "register",
+    "sign up",
+    "signup",
+    "create",
+    "send",
+    "place order",
+    "checkout",
+    "subscribe",
+    "log in",
+    "login",
+    "update",
+    "delete",
+    "post ",
 )
 
 # Markers of REAL mutation in *generated code* (not journey prose). Backend contract drafts are
@@ -114,29 +124,84 @@ _SUBMIT_VERBS = (
 # actual write or publish, we guard it. Code is a reliable signal; journey descriptions are not
 # (a contract check is routinely described as "rejects inserts" / "producers emit valid …").
 _DML_MARKERS = (
-    "insert into", "update ", "delete from", "drop table", "truncate", "create table",
+    "insert into",
+    "update ",
+    "delete from",
+    "drop table",
+    "truncate",
+    "create table",
     ".commit(",  # explicit persist; the scaffold exposes only db_inspector/db_engine (no ORM session)
 )
 _PUBLISH_MARKERS = (
-    ".produce(", ".publish(", ".send(", "kafkaproducer", "confluent_kafka", "aiokafka", "pika.",
+    ".produce(",
+    ".publish(",
+    ".send(",
+    "kafkaproducer",
+    "confluent_kafka",
+    "aiokafka",
+    "pika.",
 )
+
+
+def _executable_source(code: str) -> str:
+    """`code` reduced to executable statements — comments and module/class/function docstrings
+    removed — so prose ("rejects inserts", "delete the row") in a docstring or comment can't
+    trip the mutation markers below. Real DML/writes live in string args to execute()/produce()
+    and in method calls, which survive. Falls back to the raw text when the draft doesn't parse."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                node.body = body[1:] or [ast.Pass()]
+    try:
+        return ast.unparse(ast.fix_missing_locations(tree))
+    except Exception:
+        return code
 
 
 def _mutates_backend(code: str) -> bool:
     """True if a generated DATA/EVENT draft actually performs a write/publish (vs. read-only
     introspection or schema validation). The post-generation safety net behind is_destructive
     for backend surfaces — see _DML_MARKERS / _PUBLISH_MARKERS."""
-    lowered = code.lower()
+    lowered = _executable_source(code).lower()
     return any(m in lowered for m in _DML_MARKERS) or any(m in lowered for m in _PUBLISH_MARKERS)
 
 
+# HTTP write verbs in *generated code* — the post-generation net behind is_destructive for the
+# API surface. is_destructive only sees the elements a journey NAMED; if a draft issues a real
+# mutating request that wasn't one of them (e.g. an invented cleanup DELETE on a read-only
+# journey), this catches it from the code. DELETE/PUT/PATCH are unambiguous; POST is treated as
+# mutating here as it is everywhere else. Conservative by design — a false positive only
+# skip-guards a draft the reviewer can enable, while a miss could let a write run unguarded.
+_HTTP_WRITE_MARKERS = (".delete(", ".put(", ".patch(", ".post(")
+
+
+def _http_mutates(code: str) -> bool:
+    """True if generated API-test code issues an HTTP write (POST/PUT/PATCH/DELETE)."""
+    lowered = _executable_source(code).lower()
+    return any(m in lowered for m in _HTTP_WRITE_MARKERS)
+
+
 def is_destructive(inv: CoverageInventory, journey: Journey) -> bool:
-    """True if the journey performs a destructive action. API endpoints with a mutating
-    method always count. For web forms we flag only **password-bearing** forms or a mutating
-    form the journey **explicitly submits** — so an incidental footer/newsletter form on a
-    page doesn't flag every journey that merely visits it."""
-    by_name = {e.name: e for e in inv.elements}
-    referenced = [by_name[n] for n in journey.elements if n in by_name]
+    """True if the journey performs a destructive action. Judged over the SAME element set the
+    draft is grounded on (`_elements_for`), which falls back to the whole inventory when the
+    journey's `elements` came back empty — so a journey the LLM under-populated, or whose
+    references discovery's name-filter stripped, is assessed against the surface it will
+    actually be prompted with rather than silently treated as safe (the fail-safe that keeps a
+    generated DELETE from running unguarded). API endpoints with a mutating method always
+    count. For web forms we flag only **password-bearing** forms or a mutating form the journey
+    **explicitly submits** — so an incidental footer/newsletter form on a page doesn't flag
+    every journey that merely visits it."""
+    referenced = _elements_for(inv, journey)
 
     if any(
         e.kind == "endpoint" and (e.method or "").upper() in _MUTATING_METHODS for e in referenced
@@ -162,6 +227,7 @@ def is_destructive(inv: CoverageInventory, journey: Journey) -> bool:
 # Prompting
 # --------------------------------------------------------------------------------------
 
+
 def journey_type(*, web: bool, api: bool, event: bool = False, data: bool = False) -> str:
     """The surface tags the user prompt declares so the system prompt's per-surface rules
     resolve. Composable: a journey can touch several surfaces (e.g. 'API+EVENT'). One of
@@ -177,110 +243,111 @@ def build_system_prompt() -> str:
     'Journey type' the user prompt declares. A constant prefix is what lets prompt caching
     actually hit — 4 web/api variants used to fragment the cache and re-bill the prefix every
     call. The few extra tokens of carrying all rules are amortized to ~0 by the cache."""
-    return "\n".join([
-        "You are a senior test-automation engineer writing a FIRST-DRAFT pytest test for ONE journey",
-        "through a system. A human will review it before it is trusted.",
-        "",
-        "The context below declares a 'Journey type' naming the surfaces this journey touches —",
-        "one or a combination of WEB, API, EVENT (message queues), DATA (databases), e.g. 'API+EVENT'.",
-        "Apply the rules for EACH surface named and ignore rules for surfaces not present.",
-        "",
-        "Hard rules (these encode a product guarantee — follow them exactly):",
-        "- Output a COMPLETE, importable Python module: imports, a short module docstring naming the",
-        "  journey, and the test function(s).",
-        "- Use ONLY deterministic assertions: Python `assert` and Playwright `expect(...)`. NEVER call",
-        "  an LLM, never make the outcome subjective. The test runner decides pass/fail, not AI.",
-        "- Use ONLY the routes, endpoints, fields, forms and inputs given in the context. Do NOT",
-        "  invent paths, parameters, or field names.",
-        "- Each test must be self-contained and isolated: don't depend on order or leftover state;",
-        "  create what you need and (for mutations) clean it up.",
-        "- A role/text locator may match MULTIPLE elements (e.g. a nav link repeated in header and",
-        "  footer). If so, narrow it (scope to a region) or use `.first` — never leave it ambiguous.",
-        "- Name the function test_<snake_case>. Keep it minimal and runnable.",
-        "- Where you must guess a value or selector, leave a `# TODO:` comment so the reviewer sees it.",
-        "- Do not add explanatory prose outside the code. Return only the module source in `code`.",
-        "- Do NOT skip the test yourself — no `pytest.mark.skip`, `xfail`, or module-level `pytestmark`.",
-        "  Write it to actually run; the toolkit injects skips for destructive flows on its own.",
-        "",
-        "For journeys that touch a WEB surface:",
-        "- Use the generated Page Objects (`from pages import SomePage`) rather than raw selectors in the",
-        "  test — instantiate with the `page` fixture and call their methods. Assert with Playwright's",
-        "  web-first `expect(...)` (auto-waiting), never manual sleeps, and prefer role/label/text",
-        "  locators. Use the `page` and `base_url` fixtures.",
-        "- If you use `expect(...)`, you MUST import it: `from playwright.sync_api import expect`.",
-        "",
-        "For journeys that touch an API surface:",
-        "- Use the `api_request_context` fixture (a Playwright APIRequestContext whose base URL is already",
-        "  set and ends with '/'). Call endpoints as paths RELATIVE to that base — i.e. DROP the leading",
-        "  slash and do NOT repeat the base URL. Example: for an endpoint listed as `/character/{id}`, call",
-        "  `api_request_context.get(f\"character/{character_id}\")`, not `\"/character/{id}\"` and not the",
-        "  full URL. Obtain path-param values earlier in the same test (e.g. an id from a list response).",
-        "",
-        "For journeys with NO web surface:",
-        "- Do NOT use the `page` fixture, do NOT import or use Page Objects, and do NOT use Playwright's",
-        "  `expect(...)` Web assertions. Do NOT import `expect`.",
-        "",
-        "For journeys with NO API surface:",
-        "- Do NOT use the `api_request_context` fixture.",
-        "",
-        "For EVENT journeys (topics / event_schema — message contracts):",
-        "- Write a CONTRACT test, NOT a broker round-trip. Do NOT connect to Kafka/RabbitMQ/etc., do NOT",
-        "  publish or consume. Use the `message_schema` fixture: `schema = message_schema(\"<EventSchemaName>\")`",
-        "  returns the discovered JSON Schema for that element (use the EXACT element name from the context).",
-        "- Build a sample payload from the message's listed fields (use their example values), then assert it",
-        "  conforms: `import jsonschema; jsonschema.validate(instance=sample, schema=schema)` (a passing",
-        "  validate raises nothing). You MAY also assert that dropping a REQUIRED field raises",
-        "  `jsonschema.exceptions.ValidationError` using `pytest.raises`.",
-        "- Deterministic, needs no running broker. Do NOT use `page` or `api_request_context`.",
-        "",
-        "For DATA journeys (database tables — schema/constraint contracts):",
-        "- Write a READ-ONLY schema/constraint test against the live catalog via the `db_inspector` fixture",
-        "  (a SQLAlchemy Inspector). Do NOT insert/update/delete rows or run DML — introspect only.",
-        "- Useful calls: `db_inspector.get_table_names()`, `get_columns(\"<table>\")` (each a dict with",
-        "  'name'/'type'/'nullable'), `get_pk_constraint(t)`, `get_foreign_keys(t)`, `get_unique_constraints(t)`.",
-        "- Assert what the inventory states: the table exists, expected columns are present, and the NOT NULL /",
-        "  PK / FK / UNIQUE constraints hold. Use the EXACT table name/location from the element.",
-        "- Do NOT use `page` or `api_request_context`.",
-        "",
-        "Playwright Assertions Reference Guide (Python syntax) — for journeys using `expect(...)`:",
-        "Use only these valid `expect` assertions (and their negated counterparts starting with `not_to_`):",
-        "  expect(locator).to_be_visible() / to_be_hidden()",
-        "  expect(locator).to_be_enabled() / to_be_disabled()",
-        "  expect(locator).to_be_checked() / to_be_editable() / to_be_empty() / to_be_focused()",
-        "  expect(locator).to_contain_text(expected) / to_have_text(expected)",
-        "  expect(locator).to_have_attribute(name, value) / to_have_class(expected)",
-        "  expect(locator).to_have_id(id) / to_have_value(value) / to_have_values(values)",
-        "  expect(locator).to_have_count(count)",
-        "  expect(page).to_have_title(title_or_reg) / to_have_url(url_or_reg)",
-        "",
-        "Assertion Rules:",
-        "- Do NOT use imaginary keyword arguments or python logical operators inside `to_have_count()`. ",
-        "For example, `expect(locator).to_have_count(greater_than=0)` or `expect(locator).to_have_count(min=1)` ",
-        "are INVALID and will fail compilation. Playwright `to_have_count()` only takes an integer `count`.",
-        "- To assert that a list contains at least one item, assert that the first item is visible: ",
-        "`expect(locator.first).to_be_visible()`. Alternatively, assert that the count is not 0: ",
-        "`expect(locator).not_to_have_count(0)`.",
-        "",
-        "Data & assertion discipline (this is what separates a runnable draft from a brittle one):",
-        "- NEVER assume a specific id/username/record already exists. To read or act on a single",
-        "  resource, FIRST obtain a real id from a list/collection endpoint in the SAME test, then use",
-        "  it. If there is no list endpoint, assert `resp.status in (200, 404)` — not `== 200`.",
-        "For API journeys specifically:",
-        "- NEVER assume a collection is non-empty: check length before indexing `[0]`; if it might be",
-        "  empty, assert the response shape instead of indexing into it.",
-        "- For filtered/searched queries, do NOT assume returned field values exactly equal the filter",
-        "  input (filters are often partial/case-insensitive). Assert the field is present and, at most,",
-        "  that it relates to the filter (e.g. substring) — not strict equality.",
-        "- Prefer asserting status, JSON shape, and presence/type of REQUIRED fields over exact values",
-        "  you cannot guarantee on a live system. Do not assert exact counts or specific ids.",
-        "- Use the provided example values for inputs when they are given.",
-        "- Keep assertions MEANINGFUL — still assert what the inventory guarantees (status ranges,",
-        "  required fields, response shape). Do not weaken a test into asserting nothing.",
-    ])
+    return "\n".join(
+        [
+            "You are a senior test-automation engineer writing a FIRST-DRAFT pytest test for ONE journey",
+            "through a system. A human will review it before it is trusted.",
+            "",
+            "The context below declares a 'Journey type' naming the surfaces this journey touches —",
+            "one or a combination of WEB, API, EVENT (message queues), DATA (databases), e.g. 'API+EVENT'.",
+            "Apply the rules for EACH surface named and ignore rules for surfaces not present.",
+            "",
+            "Hard rules (these encode a product guarantee — follow them exactly):",
+            "- Output a COMPLETE, importable Python module: imports, a short module docstring naming the",
+            "  journey, and the test function(s).",
+            "- Use ONLY deterministic assertions: Python `assert` and Playwright `expect(...)`. NEVER call",
+            "  an LLM, never make the outcome subjective. The test runner decides pass/fail, not AI.",
+            "- Use ONLY the routes, endpoints, fields, forms and inputs given in the context. Do NOT",
+            "  invent paths, parameters, or field names.",
+            "- Each test must be self-contained and isolated: don't depend on order or leftover state;",
+            "  create what you need and (for mutations) clean it up.",
+            "- A role/text locator may match MULTIPLE elements (e.g. a nav link repeated in header and",
+            "  footer). If so, narrow it (scope to a region) or use `.first` — never leave it ambiguous.",
+            "- Name the function test_<snake_case>. Keep it minimal and runnable.",
+            "- Where you must guess a value or selector, leave a `# TODO:` comment so the reviewer sees it.",
+            "- Do not add explanatory prose outside the code. Return only the module source in `code`.",
+            "- Do NOT skip the test yourself — no `pytest.mark.skip`, `xfail`, or module-level `pytestmark`.",
+            "  Write it to actually run; the toolkit injects skips for destructive flows on its own.",
+            "",
+            "For journeys that touch a WEB surface:",
+            "- Use the generated Page Objects (`from pages import SomePage`) rather than raw selectors in the",
+            "  test — instantiate with the `page` fixture and call their methods. Assert with Playwright's",
+            "  web-first `expect(...)` (auto-waiting), never manual sleeps, and prefer role/label/text",
+            "  locators. Use the `page` and `base_url` fixtures.",
+            "- If you use `expect(...)`, you MUST import it: `from playwright.sync_api import expect`.",
+            "",
+            "For journeys that touch an API surface:",
+            "- Use the `api_request_context` fixture (a Playwright APIRequestContext whose base URL is already",
+            "  set and ends with '/'). Call endpoints as paths RELATIVE to that base — i.e. DROP the leading",
+            "  slash and do NOT repeat the base URL. Example: for an endpoint listed as `/character/{id}`, call",
+            '  `api_request_context.get(f"character/{character_id}")`, not `"/character/{id}"` and not the',
+            "  full URL. Obtain path-param values earlier in the same test (e.g. an id from a list response).",
+            "",
+            "For journeys with NO web surface:",
+            "- Do NOT use the `page` fixture, do NOT import or use Page Objects, and do NOT use Playwright's",
+            "  `expect(...)` Web assertions. Do NOT import `expect`.",
+            "",
+            "For journeys with NO API surface:",
+            "- Do NOT use the `api_request_context` fixture.",
+            "",
+            "For EVENT journeys (topics / event_schema — message contracts):",
+            "- Write a CONTRACT test, NOT a broker round-trip. Do NOT connect to Kafka/RabbitMQ/etc., do NOT",
+            '  publish or consume. Use the `message_schema` fixture: `schema = message_schema("<EventSchemaName>")`',
+            "  returns the discovered JSON Schema for that element (use the EXACT element name from the context).",
+            "- Build a sample payload from the message's listed fields (use their example values), then assert it",
+            "  conforms: `import jsonschema; jsonschema.validate(instance=sample, schema=schema)` (a passing",
+            "  validate raises nothing). You MAY also assert that dropping a REQUIRED field raises",
+            "  `jsonschema.exceptions.ValidationError` using `pytest.raises`.",
+            "- Deterministic, needs no running broker. Do NOT use `page` or `api_request_context`.",
+            "",
+            "For DATA journeys (database tables — schema/constraint contracts):",
+            "- Write a READ-ONLY schema/constraint test against the live catalog via the `db_inspector` fixture",
+            "  (a SQLAlchemy Inspector). Do NOT insert/update/delete rows or run DML — introspect only.",
+            '- Useful calls: `db_inspector.get_table_names()`, `get_columns("<table>")` (each a dict with',
+            "  'name'/'type'/'nullable'), `get_pk_constraint(t)`, `get_foreign_keys(t)`, `get_unique_constraints(t)`.",
+            "- Assert what the inventory states: the table exists, expected columns are present, and the NOT NULL /",
+            "  PK / FK / UNIQUE constraints hold. Use the EXACT table name/location from the element.",
+            "- Do NOT use `page` or `api_request_context`.",
+            "",
+            "Playwright Assertions Reference Guide (Python syntax) — for journeys using `expect(...)`:",
+            "Use only these valid `expect` assertions (and their negated counterparts starting with `not_to_`):",
+            "  expect(locator).to_be_visible() / to_be_hidden()",
+            "  expect(locator).to_be_enabled() / to_be_disabled()",
+            "  expect(locator).to_be_checked() / to_be_editable() / to_be_empty() / to_be_focused()",
+            "  expect(locator).to_contain_text(expected) / to_have_text(expected)",
+            "  expect(locator).to_have_attribute(name, value) / to_have_class(expected)",
+            "  expect(locator).to_have_id(id) / to_have_value(value) / to_have_values(values)",
+            "  expect(locator).to_have_count(count)",
+            "  expect(page).to_have_title(title_or_reg) / to_have_url(url_or_reg)",
+            "",
+            "Assertion Rules:",
+            "- Do NOT use imaginary keyword arguments or python logical operators inside `to_have_count()`. ",
+            "For example, `expect(locator).to_have_count(greater_than=0)` or `expect(locator).to_have_count(min=1)` ",
+            "are INVALID and will fail compilation. Playwright `to_have_count()` only takes an integer `count`.",
+            "- To assert that a list contains at least one item, assert that the first item is visible: ",
+            "`expect(locator.first).to_be_visible()`. Alternatively, assert that the count is not 0: ",
+            "`expect(locator).not_to_have_count(0)`.",
+            "",
+            "Data & assertion discipline (this is what separates a runnable draft from a brittle one):",
+            "- NEVER assume a specific id/username/record already exists. To read or act on a single",
+            "  resource, FIRST obtain a real id from a list/collection endpoint in the SAME test, then use",
+            "  it. If there is no list endpoint, assert `resp.status in (200, 404)` — not `== 200`.",
+            "For API journeys specifically:",
+            "- NEVER assume a collection is non-empty: check length before indexing `[0]`; if it might be",
+            "  empty, assert the response shape instead of indexing into it.",
+            "- For filtered/searched queries, do NOT assume returned field values exactly equal the filter",
+            "  input (filters are often partial/case-insensitive). Assert the field is present and, at most,",
+            "  that it relates to the filter (e.g. substring) — not strict equality.",
+            "- Prefer asserting status, JSON shape, and presence/type of REQUIRED fields over exact values",
+            "  you cannot guarantee on a live system. Do not assert exact counts or specific ids.",
+            "- Use the provided example values for inputs when they are given.",
+            "- Keep assertions MEANINGFUL — still assert what the inventory guarantees (status ranges,",
+            "  required fields, response shape). Do not weaken a test into asserting nothing.",
+        ]
+    )
 
 
 _SYSTEM_PROMPT = build_system_prompt()
-
 
 
 def _render_elements(elements: list[TestableElement]) -> str:
@@ -314,14 +381,38 @@ def _po_signature(e: TestableElement) -> str:
     return f"  {name}(page): .goto()"
 
 
-def build_prompt(inv: CoverageInventory, journey: Journey, *, destructive: bool = False) -> str:
+def build_prompt(
+    inv: CoverageInventory,
+    journey: Journey,
+    *,
+    destructive: bool = False,
+    surfaces: tuple[bool, bool, bool, bool] | None = None,
+) -> str:
     steps = "\n".join(f"  {i + 1}. {s.action}" for i, s in enumerate(journey.steps)) or "  (none)"
     elements = _elements_for(inv, journey)
-    # Declare the journey type so the static system prompt's conditional rules resolve.
-    web = any(e.kind in ("page", "form") for e in elements)
-    api = any(e.kind == "endpoint" for e in elements)
-    event = any(e.kind in ("topic", "event_schema") for e in elements)
-    data = any(e.kind in ("table", "migration") for e in elements)
+    # Declare the journey type so the static system prompt's conditional rules resolve. When the
+    # caller supplies `surfaces` (web, api, event, data) — the heal path, where the failing
+    # test's own code classifies it better than the whole inventory — honour those AND keep only
+    # matching-kind elements, so the element list, the per-surface hints, and the journey-type
+    # tag all agree (rather than the tag saying one thing and the lint checking another).
+    if surfaces is not None:
+        web, api, event, data = surfaces
+        kinds: set[str] = set()
+        if web:
+            kinds |= {"page", "form"}
+        if api:
+            kinds |= {"endpoint"}
+        if event:
+            kinds |= {"topic", "event_schema"}
+        if data:
+            kinds |= {"table", "migration"}
+        if kinds:
+            elements = [e for e in elements if e.kind in kinds]
+    else:
+        web = any(e.kind in ("page", "form") for e in elements)
+        api = any(e.kind == "endpoint" for e in elements)
+        event = any(e.kind in ("topic", "event_schema") for e in elements)
+        data = any(e.kind in ("table", "migration") for e in elements)
     jtype = journey_type(web=web, api=api, event=event, data=data)
     safety = ""
     if destructive:
@@ -347,7 +438,7 @@ def build_prompt(inv: CoverageInventory, journey: Journey, *, destructive: bool 
         names = [e.name for e in elements if e.kind == "event_schema"]
         if names:
             ev_line = (
-                "\nEvent schemas — call `message_schema(\"<name>\")` for the JSON Schema, then "
+                '\nEvent schemas — call `message_schema("<name>")` for the JSON Schema, then '
                 "validate a sample with jsonschema. Available: " + ", ".join(names) + ".\n"
             )
     db_line = ""
@@ -418,34 +509,52 @@ def _page_object_usage(code: str) -> tuple[set[str], set[str]]:
         if isinstance(node, ast.ImportFrom) and node.module == "pages":
             imported.update(alias.asname or alias.name for alias in node.names)
     used = {
-        node.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Name) and node.id in imported
+        node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id in imported
     }
     return imported, used
 
 
 _VALID_ASSERTIONS = {
-    "to_be_checked", "not_to_be_checked",
-    "to_be_disabled", "not_to_be_disabled",
-    "to_be_editable", "not_to_be_editable",
-    "to_be_empty", "not_to_be_empty",
-    "to_be_enabled", "not_to_be_enabled",
-    "to_be_focused", "not_to_be_focused",
-    "to_be_hidden", "not_to_be_hidden",
-    "to_be_visible", "not_to_be_visible",
-    "to_contain_text", "not_to_contain_text",
-    "to_have_attribute", "not_to_have_attribute",
-    "to_have_class", "not_to_have_class",
-    "to_have_count", "not_to_have_count",
-    "to_have_css", "not_to_have_css",
-    "to_have_id", "not_to_have_id",
-    "to_have_js_property", "not_to_have_js_property",
-    "to_have_text", "not_to_have_text",
-    "to_have_value", "not_to_have_value",
-    "to_have_values", "not_to_have_values",
-    "to_have_title", "not_to_have_title",
-    "to_have_url", "not_to_have_url",
+    "to_be_checked",
+    "not_to_be_checked",
+    "to_be_disabled",
+    "not_to_be_disabled",
+    "to_be_editable",
+    "not_to_be_editable",
+    "to_be_empty",
+    "not_to_be_empty",
+    "to_be_enabled",
+    "not_to_be_enabled",
+    "to_be_focused",
+    "not_to_be_focused",
+    "to_be_hidden",
+    "not_to_be_hidden",
+    "to_be_visible",
+    "not_to_be_visible",
+    "to_contain_text",
+    "not_to_contain_text",
+    "to_have_attribute",
+    "not_to_have_attribute",
+    "to_have_class",
+    "not_to_have_class",
+    "to_have_count",
+    "not_to_have_count",
+    "to_have_css",
+    "not_to_have_css",
+    "to_have_id",
+    "not_to_have_id",
+    "to_have_js_property",
+    "not_to_have_js_property",
+    "to_have_text",
+    "not_to_have_text",
+    "to_have_value",
+    "not_to_have_value",
+    "to_have_values",
+    "not_to_have_values",
+    "to_have_title",
+    "not_to_have_title",
+    "to_have_url",
+    "not_to_have_url",
 }
 
 
@@ -462,9 +571,15 @@ class PlaywrightAssertionVisitor(ast.NodeVisitor):
         receiver = node.func.value
 
         # Check if the receiver is a call to expect(...)
-        if isinstance(receiver, ast.Call) and isinstance(receiver.func, ast.Name) and receiver.func.id == "expect":
+        if (
+            isinstance(receiver, ast.Call)
+            and isinstance(receiver.func, ast.Name)
+            and receiver.func.id == "expect"
+        ):
             if method_name not in _VALID_ASSERTIONS:
-                self.findings.append(f"calls non-existent Playwright assertion method '{method_name}' on expect()")
+                self.findings.append(
+                    f"calls non-existent Playwright assertion method '{method_name}' on expect()"
+                )
                 return
 
             if method_name in ("to_have_count", "not_to_have_count"):
@@ -476,7 +591,9 @@ class PlaywrightAssertionVisitor(ast.NodeVisitor):
                         )
 
 
-def lint_draft(code: str, *, web: bool, api: bool, event: bool = False, data: bool = False) -> list[str]:
+def lint_draft(
+    code: str, *, web: bool, api: bool, event: bool = False, data: bool = False
+) -> list[str]:
     """Enforce best practices on a generated test. Returns human-readable violations.
 
     This is the 'guarantee, don't hope' check: drafts that violate it are regenerated once
@@ -490,7 +607,9 @@ def lint_draft(code: str, *, web: bool, api: bool, event: bool = False, data: bo
     if not any(tok in code for tok in ("assert", "expect(", "raises", "validate(")):
         findings.append("has no assertions")
     if "expect(" in code and "import expect" not in code:
-        findings.append("uses expect() but never imports it (from playwright.sync_api import expect)")
+        findings.append(
+            "uses expect() but never imports it (from playwright.sync_api import expect)"
+        )
 
     if "expect(" in code:
         try:
@@ -538,13 +657,19 @@ def _corrective(findings: list[str]) -> str:
 def run_test_file(test_file_path: Path, cwd: Path) -> tuple[int, str]:
     """Runs a single test file using pytest and captures the output.
     Returns (exit_code, output)."""
-    import subprocess
+    import os
     import shutil
+    import subprocess
 
     # Build command: use 'uv run pytest' if uv is available, else just 'pytest'
     cmd = ["pytest", "-ra", "--tb=short", str(test_file_path.relative_to(cwd))]
     if shutil.which("uv"):
-        cmd = ["uv", "run"] + cmd
+        cmd = ["uv", "run", *cmd]
+
+    # Drop VIRTUAL_ENV so `uv run` resolves (and auto-syncs) the SCAFFOLD's own venv instead of
+    # inheriting whatever venv launched the toolkit — otherwise pytest runs without the
+    # scaffold's pytest-playwright/sqlalchemy and every draft errors at collection.
+    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
 
     try:
         res = subprocess.run(
@@ -553,6 +678,7 @@ def run_test_file(test_file_path: Path, cwd: Path) -> tuple[int, str]:
             capture_output=True,
             text=True,
             timeout=30,  # 30 second timeout per test file
+            env=env,
         )
         return res.returncode, res.stdout + res.stderr
     except subprocess.TimeoutExpired as e:
@@ -565,9 +691,7 @@ def run_test_file(test_file_path: Path, cwd: Path) -> tuple[int, str]:
 
 def _runtime_corrective(output: str, *, prior_code: str | None = None) -> str:
     snippet = "\n".join(output.splitlines()[-40:])
-    msg = (
-        "\n\nYour previous draft failed at runtime. Regenerate the COMPLETE module, fixing the failure. "
-    )
+    msg = "\n\nYour previous draft failed at runtime. Regenerate the COMPLETE module, fixing the failure. "
     if prior_code:
         msg += f"Here is the draft that failed (fix it, don't start over):\n```python\n{prior_code}\n```\n"
     msg += f"Here is the pytest failure output:\n```\n{snippet}\n```\n"
@@ -581,6 +705,26 @@ def _runtime_failure_note(output: str, prior: str) -> str:
     return (
         "RUNTIME FAILURE (still failing after one self-heal). "
         f"Last pytest output: {trace}  ||  {prior}"
+    )
+
+
+# Unambiguously ENVIRONMENTAL failures — not a draft defect. `uv run` auto-syncs Python deps,
+# so the one prep step it can't do is install the browser binaries; a verify/heal run that hits
+# this must not burn a self-heal call on code that was never broken.
+_SETUP_FAILURE_SIGNALS = ("playwright install", "executable doesn't exist")
+
+
+def _is_setup_failure(output: str) -> bool:
+    """True if a failed run is environmental (browser not installed), not a draft bug."""
+    low = output.lower()
+    return any(s in low for s in _SETUP_FAILURE_SIGNALS)
+
+
+def _setup_failure_note(output: str, prior: str) -> str:
+    tail = " | ".join(line.strip() for line in output.splitlines()[-8:] if line.strip())
+    return (
+        "VERIFY INCOMPLETE — the scaffold isn't ready to run this (install browsers first: "
+        f"`uv run playwright install chromium`), then re-run. Last output: {tail}  ||  {prior}"
     )
 
 
@@ -605,7 +749,9 @@ async def _regenerate_and_validate(
     passes lint AND compiles. Non-destructive only; callers never heal skip-guarded flows."""
     draft = await provider.generate_structured(
         prompt + _runtime_corrective(output, prior_code=prior_code),
-        TestDraft, system=system_prompt, label=label,
+        TestDraft,
+        system=system_prompt,
+        label=label,
     )
     body = draft.code.strip() + "\n"
     header = _header(inv, journey, draft, destructive=False)
@@ -641,20 +787,37 @@ async def _verify_and_heal(
     discarded in favour of the original (which already passed lint + compile), so self-heal
     can never cost us a runnable draft. If the test still fails after the retry, the runtime
     trace is folded into review_notes so the still-runnable draft isn't trusted blindly."""
-    rc, output = run_test_file(path, into)
+    rc, output = await asyncio.to_thread(run_test_file, path, into)
     if rc == 0:
         return draft, body, header, False
+    if _is_setup_failure(output):
+        # Environmental, not a draft defect (e.g. browsers not installed) — leave the draft
+        # runnable and tell the reviewer how to prepare the scaffold; don't spend a heal call.
+        draft.review_notes = _setup_failure_note(output, draft.review_notes)
+        header = _header(inv, journey, draft, destructive=False)
+        path.write_text(header + body, encoding="utf-8")
+        return draft, body, header, True
 
     retry, retry_body, retry_header, clean = await _regenerate_and_validate(
-        inv, journey, provider, prompt=prompt, system_prompt=system_prompt,
-        web=web, api=api, event=event, data=data, stem=stem, label=f"write:{stem}",
-        output=output, prior_code=draft.code,
+        inv,
+        journey,
+        provider,
+        prompt=prompt,
+        system_prompt=system_prompt,
+        web=web,
+        api=api,
+        event=event,
+        data=data,
+        stem=stem,
+        label=f"write:{stem}",
+        output=output,
+        prior_code=draft.code,
     )
     # Adopt the retry only if it is itself clean & runnable; otherwise keep the original.
     if clean:
         draft, body, header = retry, retry_body, retry_header
         path.write_text(header + body, encoding="utf-8")
-        rc, output = run_test_file(path, into)
+        rc, output = await asyncio.to_thread(run_test_file, path, into)
 
     if rc != 0:
         draft.review_notes = _runtime_failure_note(output, draft.review_notes)
@@ -751,7 +914,10 @@ async def draft_tests(
         if findings:
             # one corrective retry with the specific violations fed back to the model
             draft = await provider.generate_structured(
-                prompt + _corrective(findings), TestDraft, system=system_prompt, label=f"write:{stem}"
+                prompt + _corrective(findings),
+                TestDraft,
+                system=system_prompt,
+                label=f"write:{stem}",
             )
             findings = lint_draft(draft.code, web=web, api=api, event=event, data=data)
 
@@ -759,6 +925,11 @@ async def draft_tests(
         # emitted real mutation (DML/commit or a broker publish), guard it like any
         # destructive flow. Judged from the generated CODE, not the journey prose.
         if not destructive and (event or data) and _mutates_backend(draft.code):
+            destructive = True
+        # API draft that issues an HTTP write not tied to a referenced mutating element (e.g.
+        # an invented cleanup DELETE on a read-only journey) — the inventory-level check only
+        # sees named elements, so guard it from the generated code as the backstop.
+        if not destructive and api and _http_mutates(draft.code):
             destructive = True
 
         # Inject the skip guard deterministically — never rely on the model to add it.
@@ -775,10 +946,21 @@ async def draft_tests(
             if verify and not destructive:
                 # Self-heal keeps the draft clean & runnable; it never re-quarantines.
                 draft, body, header, runtime_failed = await _verify_and_heal(
-                    inv, journey, provider,
-                    draft=draft, body=body, header=header,
-                    prompt=prompt, system_prompt=system_prompt, stem=stem,
-                    path=path, into=into, web=web, api=api, event=event, data=data,
+                    inv,
+                    journey,
+                    provider,
+                    draft=draft,
+                    body=body,
+                    header=header,
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    stem=stem,
+                    path=path,
+                    into=into,
+                    web=web,
+                    api=api,
+                    event=event,
+                    data=data,
                 )
 
             result = WriteResult(
@@ -789,7 +971,9 @@ async def draft_tests(
             # Enforce-or-quarantine: keep non-conforming drafts out of the runnable suite.
             review_dir.mkdir(parents=True, exist_ok=True)
             reasons = list(findings) + ([] if compiles else ["module does not parse"])
-            notes = "# LINT — fix before enabling:\n" + "".join(f"#   - {r}\n" for r in reasons) + "\n"
+            notes = (
+                "# LINT — fix before enabling:\n" + "".join(f"#   - {r}\n" for r in reasons) + "\n"
+            )
             path_txt = review_dir / f"{stem}.py.txt"
             path_txt.write_text(header + notes + body, encoding="utf-8")
             result = WriteResult(journey.name, path_txt, draft.confidence, True, destructive)
@@ -824,7 +1008,7 @@ class HealReport:
 def _header_value(src: str, prefix: str) -> str | None:
     for line in src.splitlines()[:10]:
         if line.startswith(prefix):
-            return line[len(prefix):].strip()
+            return line[len(prefix) :].strip()
     return None
 
 
@@ -892,6 +1076,18 @@ async def heal_failing_tests(
         if rc == 0:
             report.passed.append(path)
             continue
+        if _is_setup_failure(output):
+            # Environmental (e.g. browsers not installed), not a draft bug — don't heal it.
+            result = HealResult(
+                path.stem,
+                path,
+                fixed=False,
+                reason="scaffold not ready — run `uv run playwright install chromium`",
+            )
+            report.still_failing.append(result)
+            if on_heal is not None:
+                on_heal(result)
+            continue
 
         # Match by stable flow fingerprint first (survives renames), then filename. If neither
         # resolves, ground the fix on the failing test itself — its code has the real paths.
@@ -908,20 +1104,35 @@ async def heal_failing_tests(
             event, data = _infer_event_data(src)
             name = (_header_value(src, "# Journey:") or path.stem).split("—")[0].strip()
             journey = Journey(
-                name=name, description="(re-grounded from the failing test for a fix)",
-                priority="medium", elements=[],
+                name=name,
+                description="(re-grounded from the failing test for a fix)",
+                priority="medium",
+                elements=[],
             )
 
-        draft, body, _gen_header, clean = await _regenerate_and_validate(
-            inv, journey, provider,
-            prompt=build_prompt(inv, journey),
+        _draft, body, _gen_header, clean = await _regenerate_and_validate(
+            inv,
+            journey,
+            provider,
+            # Ground the prompt on the SAME surfaces the lint gates use — for an unmatched test
+            # those come from the test's own code (more accurate than the whole inventory), so
+            # the journey-type tag and the lint can't disagree.
+            prompt=build_prompt(inv, journey, surfaces=(web, api, event, data)),
             system_prompt=_SYSTEM_PROMPT,
-            web=web, api=api, event=event, data=data, stem=path.stem, label=f"fix:{path.stem}",
-            output=output, prior_code=src,
+            web=web,
+            api=api,
+            event=event,
+            data=data,
+            stem=path.stem,
+            label=f"fix:{path.stem}",
+            output=output,
+            prior_code=src,
         )
         if not clean:
             # The retry regressed (won't lint/compile). Keep the existing runnable file as-is.
-            result = HealResult(journey.name, path, fixed=False, reason="self-heal produced invalid code")
+            result = HealResult(
+                journey.name, path, fixed=False, reason="self-heal produced invalid code"
+            )
             report.still_failing.append(result)
             if on_heal is not None:
                 on_heal(result)
@@ -938,7 +1149,9 @@ async def heal_failing_tests(
             trace = " | ".join(ln.strip() for ln in output2.splitlines()[-15:] if ln.strip())
             note = f"# RUNTIME FAILURE (still failing after self-heal): {trace}\n"
             path.write_text(note + orig_header + body, encoding="utf-8")
-            result = HealResult(journey.name, path, fixed=False, reason="still failing after self-heal")
+            result = HealResult(
+                journey.name, path, fixed=False, reason="still failing after self-heal"
+            )
             report.still_failing.append(result)
 
         if on_heal is not None:
@@ -1039,7 +1252,8 @@ def enable_drafts(into: Path | str, *, targets: list[str] | None = None) -> list
         for t in targets:
             path = _resolve_target(tests_dir, t)
             results.append(
-                _enable_one(path) if path is not None
+                _enable_one(path)
+                if path is not None
                 else EnableResult(tests_dir / t, False, "no such test file")
             )
     else:

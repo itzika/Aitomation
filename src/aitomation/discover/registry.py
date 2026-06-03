@@ -147,8 +147,10 @@ def elements_from_registry(summary: RegistrySummary) -> list[TestableElement]:
         if s.schema_type == "JSON" and s.parsed is not None:
             inputs = [
                 InputField(
-                    name=f["name"], type=str(f.get("type", "string")),
-                    required=bool(f["required"]), where="message",
+                    name=f["name"],
+                    type=str(f.get("type", "string")),
+                    required=bool(f["required"]),
+                    where="message",
                     example=None if f.get("example") is None else str(f["example"]),
                 )
                 for f in _payload_fields(s.parsed)
@@ -157,7 +159,12 @@ def elements_from_registry(summary: RegistrySummary) -> list[TestableElement]:
             desc = f"JSON-schema subject {s.subject} (v{s.version})."
         elif s.schema_type == "AVRO" and s.parsed is not None:
             inputs = [
-                InputField(name=f["name"], type=str(f["type"]), required=bool(f["required"]), where="message")
+                InputField(
+                    name=f["name"],
+                    type=str(f["type"]),
+                    required=bool(f["required"]),
+                    where="message",
+                )
                 for f in _avro_fields(s.parsed)
             ]
             json_schema = None
@@ -203,7 +210,9 @@ Your job is judgement only:
 """
 
 
-def build_registry_judgment_prompt(summary: RegistrySummary, elements: list[TestableElement]) -> str:
+def build_registry_judgment_prompt(
+    summary: RegistrySummary, elements: list[TestableElement]
+) -> str:
     return (
         f"Schema registry: {summary.base_url}\n"
         f"Testable elements ({len(elements)}) — this list is complete and authoritative:\n"

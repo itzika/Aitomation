@@ -9,6 +9,7 @@ land in visible, timestamped per-run directories under each tested app.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import random
@@ -33,10 +34,12 @@ from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import (
     Button,
+    Collapsible,
     DataTable,
     Footer,
     Input,
     Label,
+    OptionList,
     ProgressBar,
     RadioButton,
     RadioSet,
@@ -45,6 +48,7 @@ from textual.widgets import (
     TabbedContent,
     TabPane,
 )
+from textual.widgets.option_list import Option
 
 from ..config import Backend, ConfigError, LLMConfig
 from ..diff import diff_inventories
@@ -53,13 +57,13 @@ from ..discover.crawl import discover_crawl
 from ..discover.database import discover_db
 from ..discover.openapi import discover_openapi
 from ..discover.registry import discover_registry
-from ..providers import LLMProvider, PydanticAIProvider
+from ..naming import PROJECTS_ROOT
+from ..providers import LLMProvider, PydanticAIProvider, list_models
 from ..scaffold import scaffold_project
 from ..scaffold.generator import _func_name
 from ..telemetry import DEFAULT_LOG, UsageRecorder, aggregate, load_records
+from ..workspace import SystemRecord, Workspace, slugify
 from ..write import draft_tests, enable_drafts, heal_failing_tests, select_journeys
-from ..naming import PROJECTS_ROOT
-from .workspace import SystemRecord, Workspace, slugify
 
 # Restrained dark: ONE cyan accent on cool neutral darks. The old neon triad (cyan + magenta +
 # green) is gone — magenta retired to a muted slate, the accent unified to cyan, and the loud
@@ -68,16 +72,16 @@ from .workspace import SystemRecord, Workspace, slugify
 # neutral (a literal in CSS, since custom theme vars aren't available when App.CSS is parsed).
 CYBERPUNK = Theme(
     name="cyberpunk",
-    primary="#22d3ee",     # cyan — the single accent (focus, modal borders, matches the banner)
-    secondary="#5b6b7f",   # muted slate (was magenta)
-    accent="#22d3ee",      # keep the accent in the cyan family (was neon green)
+    primary="#22d3ee",  # cyan — the single accent (focus, modal borders, matches the banner)
+    secondary="#5b6b7f",  # muted slate (was magenta)
+    accent="#22d3ee",  # keep the accent in the cyan family (was neon green)
     foreground="#cde7f0",
     background="#080b12",
     surface="#0e1320",
     panel="#141b2d",
-    success="#56d39a",     # soft green (was neon #56d39a)
-    warning="#e0b341",     # muted amber (was neon #e0b341)
-    error="#f2647b",       # rose (was neon #f2647b)
+    success="#56d39a",  # soft green (was neon #56d39a)
+    warning="#e0b341",  # muted amber (was neon #e0b341)
+    error="#f2647b",  # rose (was neon #f2647b)
     dark=True,
     variables={
         "block-cursor-foreground": "#080b12",
@@ -101,7 +105,7 @@ A system moves through three stages, shown as dots in the library: \
   f   fix: self-heal the tests that just failed (one corrective retry each)
   e   enable the selected skipped (destructive) draft — review + add teardown first
   o   open the run folder — pick VS Code / PyCharm / Cursor / Antigravity
-  m   change the provider/model (or click the title in the header)
+  m   change the provider/model — apply to the default or one stage (discover/write/fix)
   d   delete the selected system
   l   toggle the live log
   b   fold / unfold the animated header banner
@@ -115,12 +119,18 @@ A system moves through three stages, shown as dots in the library: \
   Flows     suggested end-to-end paths; select for steps
   Tests     drafts + source preview; status reflects the last run (passed / failed /
             skipped / needs review)
-  Usage     LLM token cost for this system, by prompt
+  Usage     this system's LLM cost: animated meters, ~$ estimate, the exact
+            model(s) used, and a per-run breakdown you can expand
 
 [dim]press any key to close[/]"""
 
 
 _BACKENDS: tuple[str, ...] = get_args(Backend)
+
+# The LLM-using pipeline stages a model can be pinned to (scaffold is deterministic, no LLM).
+# `default` is the fallback for any stage left unset.
+_MODEL_STAGES: tuple[str, ...] = ("discover", "write", "fix")
+_MODEL_TARGETS: tuple[str, ...] = ("default", *_MODEL_STAGES)
 
 # Colour the Tests-tab status so pass/fail/skip read at a glance.
 _STATUS_STYLE = {
@@ -163,6 +173,114 @@ def _parse_pytest_outcomes(lines: list[str]) -> dict[str, str]:
             out[name] = outcome
     return {n: ("failed" if o == "error" else o) for n, o in out.items()}
 
+
+# --- Usage tab: cost model + little graphics ------------------------------------------
+# Approximate public list prices in USD per 1M tokens (input, output) — matched by model-name
+# FAMILY so versioned names ('claude-opus-4-8', 'qwen-plus-latest') resolve without an
+# exact-match table. These give an at-a-glance "~$" estimate only; unknown models are omitted
+# from the cost sum (and counted so the UI can say "N unpriced"). Easy to update; never billed on.
+def _price_for(provider: str, model: str) -> tuple[float, float] | None:
+    m = (model or "").lower()
+    if "opus" in m:
+        return (15.0, 75.0)
+    if "sonnet" in m:
+        return (3.0, 15.0)
+    if "haiku" in m:
+        return (0.8, 4.0)
+    if "coder" in m:
+        return (1.0, 5.0)
+    if "max" in m:  # qwen-max / qwen3-max
+        return (1.6, 6.4)
+    if "turbo" in m:  # qwen-turbo
+        return (0.05, 0.2)
+    if "plus" in m:  # qwen-plus
+        return (0.4, 1.2)
+    if "gpt-4.1-mini" in m:
+        return (0.4, 1.6)
+    if "gpt-4.1" in m:
+        return (2.0, 8.0)
+    if "gpt-4o-mini" in m:
+        return (0.15, 0.6)
+    if "gpt-4o" in m or "gpt-4" in m:
+        return (2.5, 10.0)
+    return None
+
+
+def _cost_of(r: dict) -> float:
+    """Estimated USD for one call record (0 if its model isn't in the price table). Cached
+    input is billed apart from fresh input — read at ~0.1x and write at ~1.25x of the input
+    rate (Anthropic prompt-caching); providers without cache fields contribute 0 for them."""
+    price = _price_for(r.get("provider", ""), r.get("model", ""))
+    if not price:
+        return 0.0
+    in_rate, out_rate = price
+    return (
+        int(r.get("input_tokens", 0)) / 1e6 * in_rate
+        + int(r.get("output_tokens", 0)) / 1e6 * out_rate
+        + int(r.get("cache_read_tokens", 0)) / 1e6 * in_rate * 0.1
+        + int(r.get("cache_write_tokens", 0)) / 1e6 * in_rate * 1.25
+    )
+
+
+# Pipeline stage a usage record belongs to, derived from its label ('discover.crawl',
+# 'write:test_x', 'fix:test_x') — used to colour and break down the meters by stage.
+_STAGE_STYLE = {"discover": "#22d3ee", "write": "#56d39a", "fix": "#e0b341", "other": "#7f8ea3"}
+_EIGHTHS = " ▏▎▍▌▋▊▉█"  # 0/8 .. 8/8 of a cell, for sub-cell meter precision
+_SPARK = "▁▂▃▄▅▆▇█"
+
+
+def _stage_of(label: str) -> str:
+    s = str(label)
+    if s.startswith("discover"):
+        return "discover"
+    if s.startswith("write:"):
+        return "write"
+    if s.startswith("fix:"):
+        return "fix"
+    return "other"
+
+
+def _run_stamp(iso: str) -> str:
+    """Short local 'MM-DD HH:MM' stamp for a run, from a record's ISO started_at."""
+    try:
+        return datetime.fromisoformat(iso).astimezone().strftime("%m-%d %H:%M")
+    except (ValueError, TypeError):
+        return "—"
+
+
+def _bar(ratio: float, width: int, style: str, *, track: str = "#1b2533") -> Text:
+    """A horizontal meter `width` cells wide, filled to `ratio` (0..1) with 1/8-cell precision."""
+    ratio = max(0.0, min(1.0, ratio))
+    cells = ratio * width
+    full = int(cells)
+    out = Text("█" * min(full, width), style=style)
+    rem = width - full
+    if rem > 0:
+        eighth = _EIGHTHS[round((cells - full) * 8)]
+        if eighth != " ":
+            out.append(eighth, style=style)
+            rem -= 1
+        if rem > 0:
+            out.append("░" * rem, style=track)
+    return out
+
+
+def _sparkline(values: list[float], *, scale: float = 1.0) -> str:
+    """One-line bar sparkline of `values`, each scaled to the series max (x `scale`, so a
+    growing scale animates the whole line rising from the baseline)."""
+    if not values:
+        return ""
+    hi = max(values) or 1.0
+    n = len(_SPARK) - 1
+    return "".join(_SPARK[max(0, min(n, int(v * scale / hi * n)))] for v in values)
+
+
+def _ascii_bar(ratio: float, width: int = 8) -> str:
+    """A monochrome block bar (for plain-text contexts like a Collapsible title)."""
+    k = max(0, min(width, round(max(0.0, min(1.0, ratio)) * width)))
+    return "█" * k + "░" * (width - k)
+
+
 # Editors offered by the "open run folder" picker (o): (display, CLI candidates, macOS .app
 # name prefixes). GUI editors on macOS rarely put their CLI on PATH (only Cursor tends to),
 # so we detect/launch by .app bundle there; CLI is the fallback (and the Linux/Windows path).
@@ -178,7 +296,9 @@ _MACOS = sys.platform == "darwin"
 _APP_ROOTS: tuple[Path, ...] = (Path("/Applications"), Path.home() / "Applications")
 
 
-def _find_app_bundle(prefixes: tuple[str, ...], roots: tuple[Path, ...] | None = None) -> Path | None:
+def _find_app_bundle(
+    prefixes: tuple[str, ...], roots: tuple[Path, ...] | None = None
+) -> Path | None:
     """Locate an installed .app for one of `prefixes`, exact name first then prefix match."""
     roots = roots if roots is not None else _APP_ROOTS
     for pre in prefixes:
@@ -194,7 +314,9 @@ def _find_app_bundle(prefixes: tuple[str, ...], roots: tuple[Path, ...] | None =
     return None
 
 
-def _resolve_editor(cli_candidates: tuple[str, ...], app_prefixes: tuple[str, ...]) -> list[str] | None:
+def _resolve_editor(
+    cli_candidates: tuple[str, ...], app_prefixes: tuple[str, ...]
+) -> list[str] | None:
     """Return the argv prefix that launches this editor (the run dir is appended later), or
     None if it isn't installed. On macOS prefer `open -a <bundle>` since the CLI is usually
     absent; everywhere else (and as a fallback) use the CLI launcher if it's on PATH."""
@@ -385,37 +507,214 @@ class MatrixBanner(Static):
         self.app.action_choose_model()
 
 
+class UsageMeters(Static):
+    """The Usage-tab summary: hero token + ~cost totals, the model(s) used as chips, in/out
+    and per-stage meters, and a per-run cost sparkline. On mount the meters ease 0→value and
+    the totals count up once, then settle — motion on a discrete event (selecting a system),
+    like the header band that pauses during work, never a perpetual backdrop."""
+
+    DEFAULT_CSS = """
+    UsageMeters { height: auto; padding: 1 2 0 2; }
+    """
+
+    def __init__(self, data: dict) -> None:
+        super().__init__()
+        self._data = data
+        self._anim = 0.0
+        self._timer = None
+
+    def on_mount(self) -> None:
+        self._timer = self.set_interval(1 / 30, self._tick)
+
+    def _tick(self) -> None:
+        self._anim = min(1.0, self._anim + 1 / 14)  # ~0.5s fill-in
+        if self._anim >= 1.0 and self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+        self.refresh()
+
+    @staticmethod
+    def _chip(model: str, *, primary: bool) -> Text:
+        label = model if len(model) <= 24 else model[:23] + "…"
+        style = "bold #06222b on #22d3ee" if primary else "#cde7f0 on #243244"
+        return Text(f" {label} ", style=style)
+
+    def render(self) -> Text:
+        d = self._data
+        if not d:
+            return Text("")
+        e = 1 - (1 - self._anim) ** 3  # ease-out: snappy fill, gentle landing
+        total = d["total"] or 1
+        W = 26
+        t = Text()
+        # hero: token total (counting up) + estimated cost + call/latency tallies
+        t.append(f"{round(d['total'] * e):,}", style="bold #22d3ee")
+        t.append(" tok", style="#7f8ea3")
+        if d["cost"] > 0:
+            t.append("    ")
+            t.append(f"~${d['cost'] * e:,.2f}", style="bold #56d39a")
+            t.append(" est", style="dim #56d39a")
+        t.append(f"    {d['calls']} calls", style="#7f8ea3")
+        if d["duration"]:
+            t.append(f" · {d['duration']:.0f}s", style="#7f8ea3")
+        t.append("\n")
+        # model chips — the EXACT model(s) this system was discovered/written with
+        for i, m in enumerate(d["models"]):
+            if i:
+                t.append(" ")
+            t.append_text(self._chip(m, primary=(i == 0)))
+        if d["unpriced"]:
+            t.append(f"   {d['unpriced']} unpriced", style="dim #7f8ea3")
+        t.append("\n\n")
+        # in / out token meters
+        for name, val, style in (("in ", d["input"], "#22d3ee"), ("out", d["output"], "#5b6b7f")):
+            t.append(f"{name} ", style="#7f8ea3")
+            t.append_text(_bar(val / total * e, W, style))
+            t.append(f"  {val:,}\n", style="#9fb0c0")
+        if d["cache"]:
+            pct = d["cache"] / max(d["input"], 1) * 100
+            t.append("cache ", style="#7f8ea3")
+            t.append(f"{d['cache']:,} tok", style="#9fb0c0")
+            t.append(f"  ({pct:.0f}% of input reused)\n", style="dim #7f8ea3")
+        # per-stage breakdown — where the cost actually goes
+        if d["stages"]:
+            t.append("\n")
+            for stage, tok in d["stages"]:
+                style = _STAGE_STYLE.get(stage, "#7f8ea3")
+                t.append(f"{stage:<9}", style=style)
+                t.append_text(_bar(tok / total * e, W, style))
+                t.append(f"  {tok / total * 100:.0f}%\n", style="#9fb0c0")
+        # per-run cost trend (rising as the animation scales the bars up)
+        if len(d["spark"]) > 1:
+            t.append("\ntok/run ", style="#7f8ea3")
+            t.append(_sparkline(d["spark"], scale=e), style="#22d3ee")
+            t.append(f"  ({len(d['spark'])} runs)\n", style="dim #7f8ea3")
+        return t
+
+
 class ModelScreen(ModalScreen[dict | None]):
-    """Pick the provider + model the toolkit talks to. The header shows the active one;
+    """Pick the provider + model the toolkit talks to. The header shows the active default;
     clicking it (or pressing m) opens this. Switching is BYO-key: a backend with no key
-    configured is rejected with a message rather than silently failing later."""
+    configured is rejected with a message rather than silently failing later.
+
+    An `apply to` selector targets the default or a single pipeline stage (discover / write /
+    fix), so you can draft on a cheap model and self-heal on a stronger one. Switching target
+    loads that target's current backend/model into the fields.
+
+    The provider's available models are pulled live from its `/models` endpoint and shown as a
+    type-to-filter list, so you can pick (e.g.) one of Qwen's 100+ models without knowing the
+    exact id. The text field still accepts a free-typed name (or blank for the default), so it
+    keeps working offline or for a model the listing doesn't return."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
-    def __init__(self, current_backend: str, current_model: str) -> None:
+    def __init__(self, assignments: dict[str, dict[str, str]]) -> None:
         super().__init__()
-        self._backend = current_backend
-        self._model = current_model
+        # {target -> {"backend", "model"}} for "default" + each stage; the value the fields show.
+        self._assignments = assignments
+        self._models: list[str] = []  # last fetched, unfiltered
+        self._suppress = False  # ignore the RadioSet.Changed churn while reloading a target
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="model-picker"):
+        default = self._assignments["default"]
+        with VerticalScroll(id="model-picker"):
             yield Label("◢ select provider & model", id="model-title")
+            yield Label("apply to", classes="wizard-label")
+            with RadioSet(id="target"):
+                for t in _MODEL_TARGETS:
+                    yield RadioButton(t, value=(t == "default"))
             yield Label("provider", classes="wizard-label")
             with RadioSet(id="backend"):
                 for b in _BACKENDS:
-                    yield RadioButton(b, value=(b == self._backend))
-            yield Label("model (blank = provider default)", classes="wizard-label")
+                    yield RadioButton(b, value=(b == default["backend"]))
+            yield Label(
+                "model (type to filter, pick below, or blank = default)", classes="wizard-label"
+            )
             yield Input(
-                value=self._model,
+                value=default["model"],
                 placeholder="e.g. qwen-plus · claude-opus-4-8 · gpt-4.1",
                 id="model-name",
             )
+            yield Label("", id="model-status")
+            yield OptionList(id="model-list")
             with Horizontal(id="model-buttons"):
                 yield Button("Use", variant="primary", id="use")
                 yield Button("Cancel", id="cancel")
 
     def on_mount(self) -> None:
         self.query_one("#model-name", Input).focus()
+        self._fetch_models()
+
+    def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
+        if self._suppress:
+            return
+        if event.radio_set.id == "target":
+            self._load_target()  # show that target's current backend/model, then re-list
+        elif event.radio_set.id == "backend":
+            self._fetch_models()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "model-name":
+            self._refilter()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        # Picking a model fills the field (which the user can still edit before Use).
+        self.query_one("#model-name", Input).value = str(event.option.prompt)
+
+    def _selected_target(self) -> str:
+        idx = self.query_one("#target", RadioSet).pressed_index
+        return _MODEL_TARGETS[idx] if idx >= 0 else "default"
+
+    def _selected_backend(self) -> str:
+        idx = self.query_one("#backend", RadioSet).pressed_index
+        return _BACKENDS[idx] if idx >= 0 else self._assignments["default"]["backend"]
+
+    def _load_target(self) -> None:
+        """Reload the backend radio + model field from the newly-selected target's assignment."""
+        target = self._selected_target()
+        a = self._assignments.get(target) or self._assignments["default"]
+        self._suppress = True
+        try:
+            for i, btn in enumerate(self.query_one("#backend", RadioSet).query(RadioButton)):
+                if _BACKENDS[i] == a["backend"]:
+                    btn.value = True  # RadioSet deselects the others
+                    break
+        finally:
+            self._suppress = False
+        self.query_one("#model-name", Input).value = a["model"]
+        self._fetch_models()
+
+    @work(exclusive=True)
+    async def _fetch_models(self) -> None:
+        status = self.query_one("#model-status", Label)
+        self.query_one("#model-list", OptionList).clear_options()
+        self._models = []
+        backend = self._selected_backend()
+        try:
+            cfg = LLMConfig.from_env(backend=backend)
+        except ConfigError:
+            status.update("[#e0b341]no key/base_url for this provider — type a model name[/]")
+            return
+        status.update(f"[dim]listing {backend} models…[/]")
+        try:
+            models = await asyncio.to_thread(list_models, cfg)
+        except Exception as e:
+            status.update(f"[#e0b341]couldn't list models ({type(e).__name__}) — type a name[/]")
+            return
+        self._models = models
+        status.update(
+            f"[dim]{len(models)} models — type to filter[/]"
+            if models
+            else "[#e0b341]provider returned no models — type a name[/]"
+        )
+        self._refilter()
+
+    def _refilter(self) -> None:
+        q = self.query_one("#model-name", Input).value.strip().lower()
+        shown = [m for m in self._models if q in m.lower()] if q else self._models
+        ol = self.query_one("#model-list", OptionList)
+        ol.clear_options()
+        ol.add_options([Option(m) for m in shown[:300]])
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "cancel":
@@ -427,10 +726,10 @@ class ModelScreen(ModalScreen[dict | None]):
         self._submit()
 
     def _submit(self) -> None:
-        idx = self.query_one("#backend", RadioSet).pressed_index
-        backend = _BACKENDS[idx] if idx >= 0 else None
         model = self.query_one("#model-name", Input).value.strip() or None
-        self.dismiss({"backend": backend, "model": model})
+        self.dismiss(
+            {"target": self._selected_target(), "backend": self._selected_backend(), "model": model}
+        )
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -478,7 +777,11 @@ _WIZARD_SOURCES: tuple[tuple[str, str, str], ...] = (
     ("crawl", "Crawl a running web app  (URL)", "https://app.example.com"),
     ("asyncapi", "AsyncAPI spec  (file or URL)", "./asyncapi.yaml  or  https://…/asyncapi.json"),
     ("registry", "Schema registry  (live URL)", "http://localhost:8081"),
-    ("db", "Database  (connection URL or .sql DDL)", "postgresql://user@host/db   or   ./schema.sql"),
+    (
+        "db",
+        "Database  (connection URL or .sql DDL)",
+        "postgresql://user@host/db   or   ./schema.sql",
+    ),
 )
 
 
@@ -528,7 +831,9 @@ class WizardScreen(ModalScreen[dict | None]):
     def _submit(self) -> None:
         origin = self.query_one("#origin", Input).value.strip()
         if not origin:
-            self.notify("Enter a spec/app URL, connection string, or file path.", severity="warning")
+            self.notify(
+                "Enter a spec/app URL, connection string, or file path.", severity="warning"
+            )
             return
         idx = self.query_one("#source", RadioSet).pressed_index
         source = _WIZARD_SOURCES[idx][0] if 0 <= idx < len(_WIZARD_SOURCES) else "openapi"
@@ -658,12 +963,20 @@ class AitomationApp(App):
     #progress { width: 32; display: none; padding: 0 1; }
     #status { width: 1fr; padding: 0 1; color: $accent; }
     DataTable { height: 1fr; background: $surface; }
+    #usage { background: $surface; }
+    .usage-empty { padding: 1 2; }
+    .usage-run { background: $surface; margin: 0 1; }
+    .usage-run > CollapsibleTitle { color: #9fb0c0; }
+    .usage-run > CollapsibleTitle:hover { color: #22d3ee; background: $foreground 8%; }
+    .usage-run-body { padding: 0 1 1 2; color: #9fb0c0; }
     .detail { height: auto; max-height: 14; padding: 1; border-top: solid #243240; }
     HeaderTitle:hover { background: $foreground 10%; }
     #wizard { width: 64; height: auto; padding: 1 2; background: $surface; border: round $primary; }
     #wizard-title { color: $accent; text-style: bold; width: 100%; content-align: center middle; padding-bottom: 1; }
-    #model-picker { width: 60; height: auto; padding: 1 2; background: $surface; border: round $primary; }
+    #model-picker { width: 60; height: auto; max-height: 95%; padding: 1 2; background: $surface; border: round $primary; }
     #model-title { color: $accent; text-style: bold; width: 100%; content-align: center middle; padding-bottom: 1; }
+    #model-status { height: 1; color: #7f8ea3; }
+    #model-list { height: 8; margin-top: 1; border: round #243240; background: $surface; }
     #model-buttons { height: auto; padding-top: 1; align: center middle; }
     #model-buttons Button { margin: 0 1; }
     #editor-picker { width: 48; height: auto; padding: 1 2; background: $surface; border: round $primary; }
@@ -713,7 +1026,9 @@ class AitomationApp(App):
     ) -> None:
         super().__init__()
         # Default workspace lives under projects/ so generated systems don't litter the repo
-        # root. Each system gets projects/<slug>/ (see Workspace), shared with the CLI.
+        # root. Shared with the CLI: both resolve a system's scaffold + drafts to the same
+        # projects/<slug>/e2e/run-*/ run dir via this Workspace, so artifacts produced by
+        # either front-end are listed/usable by the other.
         self.workspace = Workspace(workspace_root if workspace_root is not None else PROJECTS_ROOT)
         self.recorder = UsageRecorder(app="tui-session", log_path=usage_log)
         self._injected_llm = llm
@@ -721,6 +1036,12 @@ class AitomationApp(App):
         self._provider_override = provider_override
         self._model_override = model_override
         self._config: LLMConfig | None = None
+        # Optional per-stage model overrides (discover/write/fix). A stage without an entry uses
+        # the default provider above — so you can draft on a cheap model and self-heal on a
+        # stronger one. Built lazily into providers that share the recorder, so each stage's
+        # usage is logged under its own model.
+        self._stage_cfg: dict[str, LLMConfig] = {}
+        self._stage_llm: dict[str, LLMProvider] = {}
         self._records: list[SystemRecord] = []
         self.current: SystemRecord | None = None
         self.current_inv = None
@@ -744,20 +1065,17 @@ class AitomationApp(App):
             with TabbedContent(id="tabs"):
                 with TabPane("Overview", id="tab-overview"):
                     yield VerticalScroll(Static(id="overview"))
-                with TabPane("Coverage", id="tab-surface"):
-                    with Vertical():
-                        yield DataTable(id="surface", cursor_type="row")
-                        yield Static(id="surface-detail", classes="detail")
-                with TabPane("Flows", id="tab-journeys"):
-                    with Vertical():
-                        yield DataTable(id="journeys", cursor_type="row")
-                        yield Static(id="journeys-detail", classes="detail")
-                with TabPane("Tests", id="tab-tests"):
-                    with Vertical():
-                        yield DataTable(id="tests", cursor_type="row")
-                        yield VerticalScroll(Static(id="tests-detail"), classes="detail")
+                with TabPane("Coverage", id="tab-surface"), Vertical():
+                    yield DataTable(id="surface", cursor_type="row")
+                    yield Static(id="surface-detail", classes="detail")
+                with TabPane("Flows", id="tab-journeys"), Vertical():
+                    yield DataTable(id="journeys", cursor_type="row")
+                    yield Static(id="journeys-detail", classes="detail")
+                with TabPane("Tests", id="tab-tests"), Vertical():
+                    yield DataTable(id="tests", cursor_type="row")
+                    yield VerticalScroll(Static(id="tests-detail"), classes="detail")
                 with TabPane("Usage", id="tab-usage"):
-                    yield VerticalScroll(Static(id="usage"))
+                    yield VerticalScroll(id="usage")
         log = RichLog(id="log", markup=True, highlight=False, wrap=True)
         log.border_title = "live log"
         yield log
@@ -799,7 +1117,9 @@ class AitomationApp(App):
             self.sub_title = f"{self._config.backend}:{self._config.model}"
         except ConfigError:
             self.sub_title = "no LLM key"
-            self._log("[#e0b341]no LLM configured[/] — browse/scaffold work; discover/write need a key")
+            self._log(
+                "[#e0b341]no LLM configured[/] — browse/scaffold work; discover/write need a key"
+            )
 
     def _provider_ready(self) -> bool:
         if self._llm is None:
@@ -810,19 +1130,51 @@ class AitomationApp(App):
     def _model(self) -> str | None:
         return self._model_override or (self._config.model if self._config else None)
 
+    def _provider_for(self, stage: str) -> LLMProvider | None:
+        """The provider a pipeline stage (discover/write/fix) should use: its own override if
+        one was set, else the default. None only if no default is configured (callers guard)."""
+        return self._stage_llm.get(stage) or self._llm
+
+    def _config_for(self, stage: str) -> LLMConfig | None:
+        """The LLMConfig backing a stage — its override if pinned, else the default."""
+        return self._stage_cfg.get(stage) or self._config
+
+    def _model_for(self, stage: str) -> str | None:
+        """The model name a stage will use (its override, else the default model)."""
+        cfg = self._config_for(stage)
+        return cfg.model if cfg else self._model()
+
     def action_choose_model(self) -> None:
         """Open the provider/model picker (also reachable by clicking the title bar)."""
-        backend = self._config.backend if self._config else (self._provider_override or "anthropic")
-        model = self._config.model if self._config else (self._model_override or "")
-        self.push_screen(ModelScreen(backend, model), self._on_model_chosen)
+        default_backend = (
+            self._config.backend if self._config else (self._provider_override or "anthropic")
+        )
+        default_model = self._config.model if self._config else (self._model_override or "")
+        # The model the picker shows per target: the stage's own override, or the default.
+        assignments: dict[str, dict[str, str]] = {
+            "default": {"backend": default_backend, "model": default_model}
+        }
+        for stage in _MODEL_STAGES:
+            cfg = self._stage_cfg.get(stage)
+            assignments[stage] = (
+                {"backend": cfg.backend, "model": cfg.model}
+                if cfg
+                else {"backend": default_backend, "model": ""}
+            )
+        self.push_screen(ModelScreen(assignments), self._on_model_chosen)
 
     def _on_model_chosen(self, result: dict | None) -> None:
-        if result:
+        if not result:
+            return
+        target = result.get("target", "default")
+        if target == "default":
             self._apply_model_choice(result["backend"], result["model"])
+        else:
+            self._apply_stage_model(target, result["backend"], result["model"])
 
     def _apply_model_choice(self, backend: str | None, model: str | None) -> None:
-        """Re-resolve the provider for the chosen backend/model. BYO-key: a backend with no
-        key configured is rejected here (with a message) instead of failing mid-operation."""
+        """Re-resolve the DEFAULT provider for the chosen backend/model. BYO-key: a backend with
+        no key configured is rejected here (with a message) instead of failing mid-operation."""
         try:
             cfg = LLMConfig.from_env(backend=backend, model=model)
         except ConfigError as e:
@@ -833,7 +1185,25 @@ class AitomationApp(App):
         self._config = cfg
         self._llm = PydanticAIProvider(cfg, self.recorder)
         self.sub_title = f"{cfg.backend}:{cfg.model}"
-        self._log(f"[#56d39a]model[/] → {cfg.backend}:{cfg.model} [dim](output: {cfg.output_mode})[/]")
+        self._log(
+            f"[#56d39a]model[/] → {cfg.backend}:{cfg.model} [dim](output: {cfg.output_mode})[/]"
+        )
+        if self.current is not None:
+            self._render_overview()  # the per-stage models line inherits the new default
+
+    def _apply_stage_model(self, stage: str, backend: str | None, model: str | None) -> None:
+        """Pin a specific provider/model for one stage (discover/write/fix). BYO-key: rejected
+        with a message if that backend has no key, same as the default switch."""
+        try:
+            cfg = LLMConfig.from_env(backend=backend, model=model)
+        except ConfigError as e:
+            self.notify(f"Can't set {stage} model: {e}", severity="error", timeout=8)
+            return
+        self._stage_cfg[stage] = cfg
+        self._stage_llm[stage] = PydanticAIProvider(cfg, self.recorder)
+        self._log(f"[#56d39a]{stage} model[/] → {cfg.backend}:{cfg.model}")
+        if self.current is not None:
+            self._render_overview()
 
     # -- log + status -------------------------------------------------------------------
 
@@ -845,10 +1215,8 @@ class AitomationApp(App):
 
     def _set_banner_paused(self, paused: bool) -> None:
         # Freeze the header animation around long operations; tolerate the banner being absent.
-        try:
+        with contextlib.suppress(Exception):
             self.query_one(MatrixBanner).pause(paused)
-        except Exception:  # noqa: BLE001 — purely cosmetic, never block an op on it
-            pass
 
     def _begin_progress(self, total: int | None, label: str) -> None:
         bar = self.query_one("#progress", ProgressBar)
@@ -883,7 +1251,7 @@ class AitomationApp(App):
         if action == "enable_test":
             try:
                 sel = self._selected_test()
-            except Exception:  # noqa: BLE001 — DOM may not be ready during early mount
+            except Exception:
                 return False
             return bool(sel and "skip" in sel[1])
         return True
@@ -963,10 +1331,8 @@ class AitomationApp(App):
 
     def _save_outcomes(self, run: Path) -> None:
         """Persist the current per-file outcomes next to pytest-output.txt (see _load_outcomes)."""
-        try:
+        with contextlib.suppress(OSError):
             (run / _STATUS_FILE).write_text(json.dumps(self._test_outcomes), encoding="utf-8")
-        except OSError:
-            pass
 
     def _current_index(self) -> int:
         for i, r in enumerate(self.workspace.list_systems()):
@@ -992,8 +1358,9 @@ class AitomationApp(App):
         )
         for tid in ("surface", "journeys", "tests"):
             self.query_one(f"#{tid}", DataTable).clear()
-        for did in ("surface-detail", "journeys-detail", "tests-detail", "usage"):
+        for did in ("surface-detail", "journeys-detail", "tests-detail"):
             self.query_one(f"#{did}", Static).update("")
+        self.query_one("#usage", VerticalScroll).remove_children()
 
     @staticmethod
     def _next_hint(rec: SystemRecord) -> str:
@@ -1010,8 +1377,30 @@ class AitomationApp(App):
         writes = [r for r in recs if str(r["label"]).startswith("write:")]
         n = len(writes)
         wt = sum(r["total_tokens"] for r in writes)
-        return {"any": bool(recs), "discover": disc, "n_tests": n, "write_total": wt,
-                "avg": round(wt / n) if n else 0}
+        return {
+            "any": bool(recs),
+            "discover": disc,
+            "n_tests": n,
+            "write_total": wt,
+            "avg": round(wt / n) if n else 0,
+        }
+
+    def _stage_models_line(self) -> Text | None:
+        """A compact per-stage model summary for the Overview: each LLM stage shows its pinned
+        model (starred), or the default model it inherits. None when nothing is configured
+        (e.g. an injected provider with no LLMConfig), so the line is simply omitted."""
+        if self._config is None and not self._stage_cfg:
+            return None
+        default_model = self._config.model if self._config else "—"
+        t = Text()
+        for stage in _MODEL_STAGES:
+            cfg = self._stage_cfg.get(stage)
+            t.append(f"{stage} ", style="#7f8ea3")
+            t.append(cfg.model if cfg else default_model, style="#cde7f0" if cfg else "#7f8ea3")
+            if cfg:
+                t.append("*", style="#22d3ee")
+            t.append("  ")
+        return t
 
     def _render_overview(self) -> None:
         inv, rec = self.current_inv, self.current
@@ -1030,6 +1419,11 @@ class AitomationApp(App):
         body.append(f"{inv.base_url}\n", style="dim")
         body.append(f"\nsource    {inv.source}\n")
         body.append(f"auth      {auth}\n")
+        models_line = self._stage_models_line()
+        if models_line is not None:
+            body.append("models    ")
+            body.append_text(models_line)
+            body.append("\n")
         # pipeline dots with the next step called out underneath
         body.append("pipeline  ")
         for label, on in [("discover", True), ("scaffold", rec.scaffolded), ("write", rec.drafted)]:
@@ -1053,7 +1447,9 @@ class AitomationApp(App):
         # action bar — green ✓ once a stage is done (kept above the fold)
         body.append("\nactions   ")
         body.append("[ s ] scaffold ", style="dim")
-        body.append("✓" if rec.scaffolded else "·", style="#56d39a" if rec.scaffolded else "#39455c")
+        body.append(
+            "✓" if rec.scaffolded else "·", style="#56d39a" if rec.scaffolded else "#39455c"
+        )
         body.append("   [ w ] write tests ", style="dim")
         body.append("✓" if rec.drafted else "·", style="#56d39a" if rec.drafted else "#39455c")
         body.append("   [ r ] re-discover\n", style="dim")
@@ -1062,8 +1458,13 @@ class AitomationApp(App):
             body.append("\nrun       ", style="bold #7f8ea3")
             body.append("[ t ] run pytest here   [ o ] open in editor\n", style="dim")
             body.append(f"  cd {rec.latest_run}\n", style="dim")
-            body.append("  uv sync && uv run playwright install chromium && uv run pytest -ra\n", style="dim")
-            body.append("  # containerised:  docker build -t e2e . && docker run --rm e2e\n", style="dim")
+            body.append(
+                "  uv sync && uv run playwright install chromium && uv run pytest -ra\n",
+                style="dim",
+            )
+            body.append(
+                "  # containerised:  docker build -t e2e . && docker run --rm e2e\n", style="dim"
+            )
             body.append(f"\noutput    {rec.latest_run}\n", style="dim")
         if inv.summary:
             body.append(f"\n{inv.summary}\n")
@@ -1173,29 +1574,153 @@ class AitomationApp(App):
             Syntax(code, "python", theme="ansi_dark", word_wrap=True)
         )
 
+    def _records_for_current(self) -> list[dict]:
+        """This system's usage records — flushed (on disk) plus the current session's
+        in-memory ones. Discover records are tagged with the ORIGIN (the spec/URL crawled),
+        while write/fix are tagged with the system name (the recorder.app is flipped mid-
+        discover); we match BOTH so the per-system view includes discovery cost, not just
+        write+fix. The set dedupes when a system's name and origin are the same string."""
+        ids = {self.current.name, self.current.origin}
+        recs = [r for r in load_records(self.recorder.log_path) if r.get("app") in ids]
+        recs += [r.to_dict() for r in self.recorder.records if r.app in ids]
+        return recs
+
+    @staticmethod
+    def _usage_data(records: list[dict]) -> dict:
+        """Shape this system's call records into the Usage tab's view model: overall totals,
+        ~cost, the models used (most-used first), per-stage tokens, a per-run cost series for
+        the sparkline, and one collapsible-ready summary per run (newest first)."""
+        by_run: dict[str, list[dict]] = {}
+        for r in records:
+            by_run.setdefault(str(r.get("run_id", "")), []).append(r)
+
+        def start(rs: list[dict]) -> str:
+            return min((x.get("started_at", "") for x in rs), default="")
+
+        run_items = sorted(by_run.items(), key=lambda kv: start(kv[1]))  # oldest → newest
+        spark = [sum(int(x.get("total_tokens", 0)) for x in rs) for _, rs in run_items]
+        runs = []
+        for rid, rs in reversed(run_items):  # newest first for display
+            models: list[str] = []
+            for x in rs:
+                mm = x.get("model", "")
+                if mm and mm not in models:
+                    models.append(mm)
+            in_t = sum(int(x.get("input_tokens", 0)) for x in rs)
+            out_t = sum(int(x.get("output_tokens", 0)) for x in rs)
+            runs.append(
+                {
+                    "id": rid,
+                    "stamp": _run_stamp(start(rs)),
+                    "models": models,
+                    "calls": len(rs),
+                    "input": in_t,
+                    "output": out_t,
+                    "total": in_t + out_t,
+                    "cost": sum(_cost_of(x) for x in rs),
+                    # group per (label, model) so a stage run on a different model than another
+                    # (e.g. write on Qwen, fix on Claude) shows as its own row with its model.
+                    "rows": aggregate(rs, ("label", "model")),
+                }
+            )
+        model_tok: dict[str, int] = {}
+        stage_tok: dict[str, int] = {}
+        for r in records:
+            model_tok[r.get("model", "")] = model_tok.get(r.get("model", ""), 0) + int(
+                r.get("total_tokens", 0)
+            )
+            st = _stage_of(r.get("label", ""))
+            stage_tok[st] = stage_tok.get(st, 0) + int(r.get("total_tokens", 0))
+        models = [m for m, _ in sorted(model_tok.items(), key=lambda kv: kv[1], reverse=True) if m]
+        stages = [
+            (s, stage_tok[s]) for s in ("discover", "write", "fix", "other") if stage_tok.get(s)
+        ]
+        unpriced = len(
+            {
+                r.get("model", "")
+                for r in records
+                if r.get("model") and _price_for(r.get("provider", ""), r.get("model", "")) is None
+            }
+        )
+        return {
+            "calls": len(records),
+            "input": sum(int(r.get("input_tokens", 0)) for r in records),
+            "output": sum(int(r.get("output_tokens", 0)) for r in records),
+            "total": sum(int(r.get("total_tokens", 0)) for r in records),
+            "cache": sum(int(r.get("cache_read_tokens", 0)) for r in records),
+            "duration": sum(float(r.get("duration_s", 0)) for r in records),
+            "cost": sum(_cost_of(r) for r in records),
+            "unpriced": unpriced,
+            "models": models,
+            "stages": stages,
+            "spark": spark,
+            "runs": runs,
+        }
+
+    @staticmethod
+    def _run_title(run: dict, max_total: int) -> str:
+        """Plain-text Collapsible title: when · model(s) · tokens · ~cost · a relative bar."""
+        models = "/".join(run["models"]) or "—"
+        cost = f"~${run['cost']:,.2f}" if run["cost"] > 0 else "—"
+        bar = _ascii_bar(run["total"] / (max_total or 1))
+        return f"{run['stamp']}  {models}  {run['total']:,} tok  {cost}  {bar}"
+
+    @staticmethod
+    def _run_table(run: dict) -> RichTable:
+        """Per-prompt breakdown shown inside an expanded run, stage-coloured by label. The model
+        column makes per-stage provider choices visible (e.g. write on Qwen, fix on Claude)."""
+        table = RichTable(expand=True, show_edge=False, pad_edge=False)
+        table.add_column("prompt", justify="left", overflow="ellipsis", no_wrap=True)
+        table.add_column(
+            "model", justify="left", overflow="ellipsis", no_wrap=True, style="#7f8ea3"
+        )
+        for col in ("calls", "in", "out", "total", "sec"):
+            table.add_column(col, justify="right", style="#9fb0c0")
+        for g in run["rows"]:
+            model = str(g.get("model") or "—")
+            table.add_row(
+                Text(g["label"], style=_STAGE_STYLE.get(_stage_of(g["label"]), "")),
+                model if len(model) <= 22 else model[:21] + "…",
+                str(g["calls"]),
+                f"{g['input_tokens']:,}",
+                f"{g['output_tokens']:,}",
+                f"{g['total_tokens']:,}",
+                f"{g['duration_s']:.0f}",
+            )
+        return table
+
     def _render_usage(self) -> None:
-        records = [r for r in load_records(self.recorder.log_path) if r.get("app") == self.current.name]
-        records += [r.to_dict() for r in self.recorder.records if r.app == self.current.name]
-        if not records:
-            self.query_one("#usage", Static).update(Text("No LLM usage recorded for this system yet.", style="dim"))
+        if self.current is None:
             return
-        table = RichTable(expand=True)
-        for col in ("prompt", "calls", "in", "out", "total", "sec"):
-            table.add_column(col, justify="left" if col == "prompt" else "right")
-        for g in aggregate(records, ("label",)):
-            table.add_row(g["label"], str(g["calls"]), f"{g['input_tokens']:,}",
-                          f"{g['output_tokens']:,}", f"{g['total_tokens']:,}", f"{g['duration_s']}")
-        total = aggregate(records, ())[0]  # overall total across all prompts
-        table.add_section()
-        table.add_row("TOTAL", str(total["calls"]), f"{total['input_tokens']:,}",
-                      f"{total['output_tokens']:,}", f"{total['total_tokens']:,}",
-                      f"{total['duration_s']}", style="bold #56d39a")
-        self.query_one("#usage", Static).update(table)
+        container = self.query_one("#usage", VerticalScroll)
+        container.remove_children()
+        records = self._records_for_current()
+        if not records:
+            container.mount(
+                Static(
+                    Text("No LLM usage recorded for this system yet.", style="dim"),
+                    classes="usage-empty",
+                )
+            )
+            return
+        data = self._usage_data(records)
+        max_total = max((r["total"] for r in data["runs"]), default=1)
+        widgets: list = [UsageMeters(data)]
+        for i, run in enumerate(data["runs"]):
+            widgets.append(
+                Collapsible(
+                    Static(self._run_table(run), classes="usage-run-body"),
+                    title=self._run_title(run, max_total),
+                    collapsed=(i != 0),
+                    classes="usage-run",
+                )
+            )
+        container.mount(*widgets)
 
     # -- actions ------------------------------------------------------------------------
 
     def action_new_system(self) -> None:
-        self.push_screen(WizardScreen(self._model() or ""), self._on_wizard)
+        self.push_screen(WizardScreen(self._model_for("discover") or ""), self._on_wizard)
 
     def _on_wizard(self, result: dict | None) -> None:
         if not result or not self._provider_ready():
@@ -1207,7 +1732,7 @@ class AitomationApp(App):
             self.notify("Select a system first.", severity="warning")
             return
         if self._provider_ready():
-            self.run_discover(self.current.source, self.current.origin, self._model())
+            self.run_discover(self.current.source, self.current.origin, self._model_for("discover"))
 
     def action_scaffold(self) -> None:
         if self.current is None or self.current_inv is None:
@@ -1222,7 +1747,7 @@ class AitomationApp(App):
         )
         try:
             scaffold_project(self.current_inv, run)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self._log(f"[#f2647b]scaffold failed[/] {escape(str(e))}")
             self.notify(f"Scaffold failed: {e}", severity="error")
             return
@@ -1268,10 +1793,14 @@ class AitomationApp(App):
 
     def action_fix_failing(self) -> None:
         if self.current is None or not self.current.latest_run:
-            self.notify("Nothing to fix — scaffold (s) and run tests (t) first.", severity="warning")
+            self.notify(
+                "Nothing to fix — scaffold (s) and run tests (t) first.", severity="warning"
+            )
             return
         if not self._last_run_failed:
-            self.notify("Nothing to fix — run tests (t) first; fix targets failures.", severity="warning")
+            self.notify(
+                "Nothing to fix — run tests (t) first; fix targets failures.", severity="warning"
+            )
             return
         if self._provider_ready():
             self.run_fix()
@@ -1367,7 +1896,11 @@ class AitomationApp(App):
             self._log(f"  [#56d39a]new flow(s)[/]: {names} — press [b]w[/] to draft them")
         if rec.latest_run and d.affected_journeys:
             tests = Path(rec.latest_run) / "tests"
-            stale = [j.name for j in d.affected_journeys if (tests / f"test_{_func_name(j.name)}.py").exists()]
+            stale = [
+                j.name
+                for j in d.affected_journeys
+                if (tests / f"test_{_func_name(j.name)}.py").exists()
+            ]
             if stale:
                 self._log("  [#e0b341]⚠ existing test(s) may be stale[/]: " + ", ".join(stale))
         self.notify(f"Changes since last discover — {d.summary()}", timeout=8)
@@ -1376,14 +1909,17 @@ class AitomationApp(App):
 
     @work(exclusive=True, group="op")
     async def run_discover(self, source: str, origin: str, model: str | None) -> None:
-        provider = self._llm
-        if model and self._config and model != self._config.model:
+        # Default to the discover-stage model; a model typed in the wizard is a one-off override
+        # for this discovery only, applied on the discover stage's (or default) backend.
+        provider = self._provider_for("discover")
+        base_cfg = self._config_for("discover")
+        if model and base_cfg and model != base_cfg.model:
             try:
                 provider = PydanticAIProvider(
-                    LLMConfig.from_env(backend=self._config.backend, model=model), self.recorder
+                    LLMConfig.from_env(backend=base_cfg.backend, model=model), self.recorder
                 )
             except ConfigError:
-                provider = self._llm
+                provider = self._provider_for("discover")
         self.recorder.app = origin
         self._begin_progress(None, f"discovering {escape(origin)} …")
         # `source` is a wizard key on a new discover, but re-discover passes the saved
@@ -1402,7 +1938,7 @@ class AitomationApp(App):
                 inv = await discover_crawl(
                     origin, provider, on_page=lambda p: self._log(f"crawled {escape(p.url)}")
                 )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self._log(f"[#f2647b]discovery failed[/] {escape(str(e))}")
             self.notify(f"Discovery failed: {type(e).__name__}: {e}", severity="error", timeout=8)
             return
@@ -1414,8 +1950,10 @@ class AitomationApp(App):
         rec = self.workspace.save(inv, origin=origin)
         self.recorder.app = inv.system_name
         self.recorder.flush()
-        self._log(f"[#56d39a]discovered[/] {inv.system_name} — {len(inv.elements)} elements, "
-                  f"{len(inv.suggested_journeys)} flows · next: scaffold ([b]s[/])")
+        self._log(
+            f"[#56d39a]discovered[/] {inv.system_name} — {len(inv.elements)} elements, "
+            f"{len(inv.suggested_journeys)} flows · next: scaffold ([b]s[/])"
+        )
         if baseline is not None:
             self._report_inventory_diff(baseline, inv, rec)
         self._refresh_systems(select=0)
@@ -1429,7 +1967,9 @@ class AitomationApp(App):
     async def run_tests(self) -> None:
         run = Path(self.current.latest_run)
         log = self.query_one("#log", RichLog)
-        self._log("[#22d3ee]running pytest[/] [dim](the test runner decides pass/fail — the AI never does)[/]")
+        self._log(
+            "[#22d3ee]running pytest[/] [dim](the test runner decides pass/fail — the AI never does)[/]"
+        )
         self._begin_progress(None, f"pytest in {run.name} …")
         env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
         captured: list[str] = []
@@ -1437,8 +1977,15 @@ class AitomationApp(App):
             proc = await asyncio.create_subprocess_exec(
                 # -rA: list EVERY test's outcome in the summary so the Tests tab can show
                 # per-file pass/fail from this run (not just stale file markers).
-                "uv", "run", "pytest", "-rA", "--tb=short", cwd=str(run), env=env,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                "uv",
+                "run",
+                "pytest",
+                "-rA",
+                "--tb=short",
+                cwd=str(run),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
             )
             assert proc.stdout is not None
             async for raw in proc.stdout:
@@ -1454,16 +2001,23 @@ class AitomationApp(App):
 
         # Persist the full output, and surface the reasons (not just an exit code).
         (run / "pytest-output.txt").write_text("\n".join(captured), encoding="utf-8")
-        summary_at = next((i for i, ln in enumerate(captured) if "short test summary info" in ln), None)
+        summary_at = next(
+            (i for i, ln in enumerate(captured) if "short test summary info" in ln), None
+        )
         tail = captured[summary_at:] if summary_at is not None else captured[-25:]
         counts = next(
-            (ln.strip("= ") for ln in reversed(captured)
-             if " in " in ln and any(w in ln for w in ("passed", "failed", "error"))),
+            (
+                ln.strip("= ")
+                for ln in reversed(captured)
+                if " in " in ln and any(w in ln for w in ("passed", "failed", "error"))
+            ),
             f"exit {rc}",
         )
         verdict = "[#56d39a]✓[/]" if rc == 0 else "[#f2647b]✗[/]"
         self._log(f"{verdict} pytest: {counts}  [dim](full output → {run}/pytest-output.txt)[/]")
-        self.notify(f"pytest: {counts}", severity="information" if rc == 0 else "warning", timeout=8)
+        self.notify(
+            f"pytest: {counts}", severity="information" if rc == 0 else "warning", timeout=8
+        )
         self._last_run_failed = rc != 0
         self.refresh_bindings()  # reveal/hide [f] in the footer
         # Reflect THIS run's per-test results in the Tests tab status column, and persist them
@@ -1472,7 +2026,8 @@ class AitomationApp(App):
         self._save_outcomes(run)
         self._render_tests()
         self.push_screen(
-            ResultsScreen(f"pytest — {counts}", "\n".join(tail), has_failures=rc != 0), self._on_results
+            ResultsScreen(f"pytest — {counts}", "\n".join(tail), has_failures=rc != 0),
+            self._on_results,
         )
 
     def _on_results(self, fix: bool | None) -> None:
@@ -1491,12 +2046,16 @@ class AitomationApp(App):
             if r.confidence == "existing":
                 self._log(f"[dim]kept {r.path.name} (already drafted)[/]")
             else:
-                self._log(f"drafted {r.path.name} — {'skip (destructive)' if r.destructive else 'ok'}")
+                self._log(
+                    f"drafted {r.path.name} — {'skip (destructive)' if r.destructive else 'ok'}"
+                )
 
         try:
             # Non-destructive: only new flows are drafted; existing tests are kept.
-            report = await draft_tests(self.current_inv, self._llm, into=dest, on_draft=progress)
-        except Exception as e:  # noqa: BLE001
+            report = await draft_tests(
+                self.current_inv, self._provider_for("write"), into=dest, on_draft=progress
+            )
+        except Exception as e:
             self._log(f"[#f2647b]write failed[/] {escape(str(e))}")
             self.notify(f"Write failed: {type(e).__name__}: {e}", severity="error", timeout=8)
             return
@@ -1513,16 +2072,24 @@ class AitomationApp(App):
     async def run_fix(self) -> None:
         inv, dest = self.current_inv, Path(self.current.latest_run)
         self.recorder.app = self.current.name
-        self._log("[#22d3ee]fixing[/] [dim]re-running each draft; self-healing the failures (one retry each)[/]")
+        self._log(
+            "[#22d3ee]fixing[/] [dim]re-running each draft; self-healing the failures (one retry each)[/]"
+        )
         self._begin_progress(None, "fixing failing tests …")
 
         def progress(r) -> None:
-            verb = "[#56d39a]fixed[/]" if r.fixed else f"[#f2647b]still failing[/] [dim]({r.reason})[/]"
+            verb = (
+                "[#56d39a]fixed[/]"
+                if r.fixed
+                else f"[#f2647b]still failing[/] [dim]({r.reason})[/]"
+            )
             self._log(f"{verb} {r.path.name}")
 
         try:
-            report = await heal_failing_tests(inv, self._llm, into=dest, on_heal=progress)
-        except Exception as e:  # noqa: BLE001
+            report = await heal_failing_tests(
+                inv, self._provider_for("fix"), into=dest, on_heal=progress
+            )
+        except Exception as e:
             self._log(f"[#f2647b]fix failed[/] {escape(str(e))}")
             self.notify(f"Fix failed: {type(e).__name__}: {e}", severity="error", timeout=8)
             return
@@ -1537,11 +2104,12 @@ class AitomationApp(App):
             self._log("[#56d39a]fix[/] nothing to fix — all drafts pass")
             self.notify("Nothing to fix — all drafts pass.")
         else:
-            verdict = "[#56d39a]✓[/]" if n_left == 0 else "[#e0b341]∼[/]"
+            verdict = "[#56d39a]✓[/]" if n_left == 0 else "[#e0b341]~[/]"
             self._log(f"{verdict} fix: [#56d39a]{n_fixed} fixed[/] · {n_left} still failing")
             self.notify(
                 f"Fixed {n_fixed}; {n_left} still failing.",
-                severity="information" if n_left == 0 else "warning", timeout=8,
+                severity="information" if n_left == 0 else "warning",
+                timeout=8,
             )
         # Reflect the heal results in the status column: just-fixed tests now read 'passed',
         # ones that still fail read 'failed' — overriding any stale RUNTIME FAILURE marker.
@@ -1554,5 +2122,7 @@ class AitomationApp(App):
         self.query_one("#tabs", TabbedContent).active = "tab-tests"
 
 
-def run(*, provider: str | None = None, model: str | None = None, usage_log: str = DEFAULT_LOG) -> None:
+def run(
+    *, provider: str | None = None, model: str | None = None, usage_log: str = DEFAULT_LOG
+) -> None:
     AitomationApp(provider_override=provider, model_override=model, usage_log=usage_log).run()

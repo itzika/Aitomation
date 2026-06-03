@@ -9,9 +9,19 @@ from aitomation.tui.workspace import Workspace, slugify
 
 def _inv(name: str = "Demo API") -> CoverageInventory:
     return CoverageInventory(
-        system_name=name, base_url="https://x", source="openapi",
-        elements=[Element(kind="endpoint", name="getX", location="/x", method="GET",
-                          description="d", priority="high")],
+        system_name=name,
+        base_url="https://x",
+        source="openapi",
+        elements=[
+            Element(
+                kind="endpoint",
+                name="getX",
+                location="/x",
+                method="GET",
+                description="d",
+                priority="high",
+            )
+        ],
         suggested_journeys=[Journey(name="J", description="d", priority="high")],
     )
 

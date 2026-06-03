@@ -6,11 +6,15 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "copier>=9.15.1",
-    "jsonschema>=4.26.0",
+    # httpx and rich are imported directly (discover/* HTTP, CLI+TUI rendering). They also
+    # arrive transitively via pydantic-ai/typer/textual, but the imports are first-party, so
+    # declare them explicitly rather than relying on another package keeping them as a dep.
+    "httpx>=0.27",
     "playwright>=1.60.0",
     "pydantic-ai-slim[anthropic,openai]>=1.104.0",
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0.3",
+    "rich>=13.7",
     "sqlalchemy>=2.0.50",
     "sqlglot>=30.8.0",
     "textual>=8.2.7",
@@ -24,6 +28,8 @@ aitomation = "aitomation.cli:main"
 dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.4.0",
+    "ruff>=0.15.15",
+    "ty>=0.0.42",
 ]
 
 [build-system]
@@ -38,3 +44,22 @@ artifacts = ["src/aitomation/scaffold/template/**"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"  # match requires-python floor so UP rules don't suggest 3.13-only syntax
+# Never lint generated output or the Copier template (ships .jinja, not valid standalone Python).
+extend-exclude = ["src/aitomation/scaffold/template", "projects", "e2e", ".aitomation"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PIE", "RUF"]
+ignore = [
+    "E501",   # line length is the formatter's responsibility; don't double-enforce on strings/comments
+    "B008",   # Typer Option()/Argument() defaults are the framework's intended DI pattern
+    "RUF012", # Textual BINDINGS/CSS-style mutable class attrs are framework idioms, not bugs
+    "UP047",  # classic TypeVar style is used deliberately (module T shared by the protocol + helpers)
+    "SIM102", # nested guards are kept for parallel readability (web/api/event/data each a top-level if)
+]
+
+[tool.ty.environment]
+python-version = "3.12"

@@ -34,10 +34,17 @@ class LLMProvider(Protocol):
     `label` names the operation/prompt for usage instrumentation (e.g. 'discover.openapi',
     'write:test_pet_lifecycle')."""
 
-    async def generate(self, prompt: str, *, system: str | None = None, label: str = "generate") -> str: ...
+    async def generate(
+        self, prompt: str, *, system: str | None = None, label: str = "generate"
+    ) -> str: ...
 
     async def generate_structured(
-        self, prompt: str, schema: type[T], *, system: str | None = None, label: str = "generate_structured"
+        self,
+        prompt: str,
+        schema: type[T],
+        *,
+        system: str | None = None,
+        label: str = "generate_structured",
     ) -> T: ...
 
 
@@ -63,7 +70,7 @@ def _build_settings(cfg: LLMConfig) -> ModelSettings:
     system prompt + a fixed Pydantic schema), so caching them bills the prefix at ~0.1x after
     the first call. OpenAI/DashScope and local servers do prefix caching implicitly server-
     side, so they need no equivalent flag here."""
-    base = dict(temperature=cfg.temperature, max_tokens=cfg.max_tokens)
+    base = {"temperature": cfg.temperature, "max_tokens": cfg.max_tokens}
     if cfg.backend == "anthropic":
         from pydantic_ai.models.anthropic import AnthropicModelSettings
 
@@ -73,6 +80,51 @@ def _build_settings(cfg: LLMConfig) -> ModelSettings:
             anthropic_cache_tool_definitions=True,
         )
     return ModelSettings(**base)
+
+
+def _result_usage(result: object) -> object | None:
+    """The usage object off an agent run, tolerating Pydantic AI's API shape across versions.
+
+    `AgentRunResult.usage` is currently a property-like accessor returning a `RunUsage`; older
+    releases exposed it as a `.usage()` method. Read the attribute, and if it came back as a
+    bare callable without token fields, call it — so a future revert to the method form can't
+    silently make telemetry record zeros."""
+    u = getattr(result, "usage", None)
+    if u is not None and not hasattr(u, "input_tokens") and callable(u):
+        try:
+            u = u()
+        except Exception:
+            return None
+    return u
+
+
+def list_models(config: LLMConfig, *, timeout: float = 15.0) -> list[str]:
+    """The model IDs the configured provider currently offers, fetched from its `/models`
+    endpoint. Model-agnostic: OpenAI / openai-compatible / DashScope share the OpenAI listing
+    shape; Anthropic uses its own auth headers. This lets a picker show real choices (e.g.
+    Qwen's 100+ models) instead of requiring an exact name typed by hand. BYO-key: needs the
+    same credentials as inference. Raises on transport/HTTP errors so the caller can surface
+    why (no key, bad base_url, offline)."""
+    import httpx
+
+    if config.backend == "anthropic":
+        base = (config.base_url or "https://api.anthropic.com").rstrip("/")
+        url = f"{base}/models" if base.endswith("/v1") else f"{base}/v1/models"
+        headers = {"x-api-key": config.api_key or "", "anthropic-version": "2023-06-01"}
+    else:
+        # openai / openai-compatible / dashscope all expose GET {base}/models.
+        base = (config.base_url or "https://api.openai.com/v1").rstrip("/")
+        url = f"{base}/models"
+        headers = {"Authorization": f"Bearer {config.api_key}"} if config.api_key else {}
+
+    resp = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
+    resp.raise_for_status()
+    data = resp.json()
+    items = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+    ids = [str(m["id"]) for m in items if isinstance(m, dict) and m.get("id")]
+    return sorted(set(ids))
 
 
 def _build_model(cfg: LLMConfig) -> Model:
@@ -105,7 +157,9 @@ class PydanticAIProvider:
         self._settings = _build_settings(config)
 
     @classmethod
-    def from_env(cls, *, backend: str | None = None, model: str | None = None) -> "PydanticAIProvider":
+    def from_env(
+        cls, *, backend: str | None = None, model: str | None = None
+    ) -> PydanticAIProvider:
         return cls(LLMConfig.from_env(backend=backend, model=model))
 
     async def _run(self, agent: Agent, prompt: str, system: str | None, label: str):
@@ -119,7 +173,7 @@ class PydanticAIProvider:
         try:
             result = await agent.run(prompt)
             return result
-        except Exception as e:  # noqa: BLE001 — record the failed call, then re-raise
+        except Exception as e:
             ok, error = False, f"{type(e).__name__}: {e}"
             raise
         finally:
@@ -129,7 +183,7 @@ class PydanticAIProvider:
                 model=self.config.model,
                 system=system,
                 user=prompt,
-                usage=getattr(result, "usage", None),
+                usage=_result_usage(result),
                 duration_s=time.perf_counter() - t0,
                 started_at=started_at,
                 ended_at=_now(),
@@ -137,7 +191,9 @@ class PydanticAIProvider:
                 error=error,
             )
 
-    async def generate(self, prompt: str, *, system: str | None = None, label: str = "generate") -> str:
+    async def generate(
+        self, prompt: str, *, system: str | None = None, label: str = "generate"
+    ) -> str:
         agent: Agent[None, str] = Agent(
             self._model,
             system_prompt=system or (),
@@ -147,7 +203,12 @@ class PydanticAIProvider:
         return result.output
 
     async def generate_structured(
-        self, prompt: str, schema: type[T], *, system: str | None = None, label: str = "generate_structured"
+        self,
+        prompt: str,
+        schema: type[T],
+        *,
+        system: str | None = None,
+        label: str = "generate_structured",
     ) -> T:
         agent: Agent[None, T] = Agent(
             self._model,

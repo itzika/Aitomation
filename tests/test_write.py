@@ -36,19 +36,45 @@ def _inv() -> CoverageInventory:
         source="openapi",
         auth_strategy=None,
         elements=[
-            Element(kind="endpoint", name="list_things", location="/things", method="GET",
-                    description="List", priority="medium"),
-            Element(kind="endpoint", name="get_thing", location="/things/{id}", method="GET",
-                    description="Read", priority="high"),
+            Element(
+                kind="endpoint",
+                name="list_things",
+                location="/things",
+                method="GET",
+                description="List",
+                priority="medium",
+            ),
+            Element(
+                kind="endpoint",
+                name="get_thing",
+                location="/things/{id}",
+                method="GET",
+                description="Read",
+                priority="high",
+            ),
         ],
         suggested_journeys=[
-            Journey(name="Low one", description="low", priority="low",
-                    steps=[JourneyStep(action="x")], elements=["list_things"]),
-            Journey(name="High one", description="hi", priority="high",
-                    steps=[JourneyStep(action="list"), JourneyStep(action="get")],
-                    elements=["list_things", "get_thing"]),
-            Journey(name="Mid one", description="mid", priority="medium",
-                    steps=[JourneyStep(action="y")], elements=["get_thing"]),
+            Journey(
+                name="Low one",
+                description="low",
+                priority="low",
+                steps=[JourneyStep(action="x")],
+                elements=["list_things"],
+            ),
+            Journey(
+                name="High one",
+                description="hi",
+                priority="high",
+                steps=[JourneyStep(action="list"), JourneyStep(action="get")],
+                elements=["list_things", "get_thing"],
+            ),
+            Journey(
+                name="Mid one",
+                description="mid",
+                priority="medium",
+                steps=[JourneyStep(action="y")],
+                elements=["get_thing"],
+            ),
         ],
     )
 
@@ -68,10 +94,14 @@ class _FakeProvider:
         self.prompts: list[str] = []
         self.labels: list[str] = []
 
-    async def generate(self, prompt: str, *, system: str | None = None, label: str = "") -> str:  # pragma: no cover
+    async def generate(
+        self, prompt: str, *, system: str | None = None, label: str = ""
+    ) -> str:  # pragma: no cover
         return ""
 
-    async def generate_structured(self, prompt, schema: type[T], *, system=None, label: str = "") -> T:
+    async def generate_structured(
+        self, prompt, schema: type[T], *, system=None, label: str = ""
+    ) -> T:
         self.prompts.append(prompt)
         self.labels.append(label)
         if self.codes is not None:
@@ -177,51 +207,110 @@ async def test_draft_tests_skip_survives_journey_rename(tmp_path):
 
 def _mutating_inv() -> CoverageInventory:
     return CoverageInventory(
-        system_name="Store", base_url="https://store.demo", source="openapi", auth_strategy="apiKey",
+        system_name="Store",
+        base_url="https://store.demo",
+        source="openapi",
+        auth_strategy="apiKey",
         elements=[
-            Element(kind="endpoint", name="list_pets", location="/pets", method="GET",
-                    description="List", priority="medium"),
-            Element(kind="endpoint", name="create_pet", location="/pets", method="POST",
-                    description="Create", priority="high"),
-            Element(kind="endpoint", name="delete_pet", location="/pets/{id}", method="DELETE",
-                    description="Delete", priority="high"),
+            Element(
+                kind="endpoint",
+                name="list_pets",
+                location="/pets",
+                method="GET",
+                description="List",
+                priority="medium",
+            ),
+            Element(
+                kind="endpoint",
+                name="create_pet",
+                location="/pets",
+                method="POST",
+                description="Create",
+                priority="high",
+            ),
+            Element(
+                kind="endpoint",
+                name="delete_pet",
+                location="/pets/{id}",
+                method="DELETE",
+                description="Delete",
+                priority="high",
+            ),
         ],
         suggested_journeys=[
-            Journey(name="Read pets", description="r", priority="high",
-                    steps=[JourneyStep(action="list")], elements=["list_pets"]),
-            Journey(name="Create and delete", description="crud", priority="high",
-                    steps=[JourneyStep(action="create"), JourneyStep(action="delete")],
-                    elements=["create_pet", "delete_pet"]),
+            Journey(
+                name="Read pets",
+                description="r",
+                priority="high",
+                steps=[JourneyStep(action="list")],
+                elements=["list_pets"],
+            ),
+            Journey(
+                name="Create and delete",
+                description="crud",
+                priority="high",
+                steps=[JourneyStep(action="create"), JourneyStep(action="delete")],
+                elements=["create_pet", "delete_pet"],
+            ),
         ],
     )
 
 
 def test_is_destructive_web_forms_password_or_explicit_submit():
     inv = CoverageInventory(
-        system_name="Web", base_url="https://web.demo", source="crawl",
+        system_name="Web",
+        base_url="https://web.demo",
+        source="crawl",
         elements=[
-            Element(kind="form", name="login_form", location="/login", method="POST",
-                    description="login", priority="high",
-                    inputs=[InputField(name="email", where="form"),
-                            InputField(name="password", where="form", type="password")]),
-            Element(kind="form", name="newsletter_form", location="/", method="POST",
-                    description="newsletter", priority="medium",
-                    inputs=[InputField(name="email", where="form")]),
-            Element(kind="form", name="search_form", location="/products", method="GET",
-                    description="search", priority="medium",
-                    inputs=[InputField(name="q", where="form")]),
+            Element(
+                kind="form",
+                name="login_form",
+                location="/login",
+                method="POST",
+                description="login",
+                priority="high",
+                inputs=[
+                    InputField(name="email", where="form"),
+                    InputField(name="password", where="form", type="password"),
+                ],
+            ),
+            Element(
+                kind="form",
+                name="newsletter_form",
+                location="/",
+                method="POST",
+                description="newsletter",
+                priority="medium",
+                inputs=[InputField(name="email", where="form")],
+            ),
+            Element(
+                kind="form",
+                name="search_form",
+                location="/products",
+                method="GET",
+                description="search",
+                priority="medium",
+                inputs=[InputField(name="q", where="form")],
+            ),
         ],
         suggested_journeys=[],
     )
 
     def j(name, elements, *steps):
-        return Journey(name=name, description=name, priority="high",
-                       steps=[JourneyStep(action=s) for s in steps], elements=elements)
+        return Journey(
+            name=name,
+            description=name,
+            priority="high",
+            steps=[JourneyStep(action=s) for s in steps],
+            elements=elements,
+        )
 
     # password-bearing form → destructive regardless of verbs
     assert is_destructive(inv, j("login", ["login_form"], "go to login", "enter creds")) is True
     # incidental POST footer form (journey doesn't submit it) → NOT destructive
-    assert is_destructive(inv, j("browse", ["newsletter_form"], "land on home", "read page")) is False
+    assert (
+        is_destructive(inv, j("browse", ["newsletter_form"], "land on home", "read page")) is False
+    )
     # the same form, explicitly submitted → destructive
     assert is_destructive(inv, j("sub", ["newsletter_form"], "subscribe to newsletter")) is True
     # GET search form is never destructive, even with a submit verb
@@ -234,6 +323,76 @@ def test_is_destructive_flags_mutating_journeys():
     crud = next(j for j in inv.suggested_journeys if j.name == "Create and delete")
     assert is_destructive(inv, read) is False
     assert is_destructive(inv, crud) is True
+
+
+def test_is_destructive_empty_elements_fails_safe():
+    # The gap: a journey whose `elements` came back empty (LLM under-populated it, or
+    # discovery's name-filter stripped every reference) is grounded on the FULL surface — so it
+    # must be judged over that surface, not silently treated as safe. Over a mutating system it
+    # is destructive; over a read-only (GET-only) one it stays safe.
+    empty = Journey(
+        name="Ambiguous",
+        description="delete the pet via DELETE /pets/{id}",
+        priority="high",
+        steps=[JourneyStep(action="remove the pet")],
+        elements=[],
+    )
+    assert is_destructive(_mutating_inv(), empty) is True
+    read_only = Journey(name="x", description="d", priority="high", steps=[], elements=[])
+    assert is_destructive(_inv(), read_only) is False
+
+
+async def test_draft_guards_empty_element_journey_over_mutating_system(tmp_path):
+    # End-to-end: the empty-elements journey over a mutating system must be skip-guarded, not
+    # written runnable. (Without the fail-safe, is_destructive returned False and no guard was
+    # injected — a generated mutation could run.)
+    inv = _mutating_inv()
+    inv.suggested_journeys = [
+        Journey(
+            name="Ambiguous flow",
+            description="touches the API",
+            priority="high",
+            steps=[JourneyStep(action="do something")],
+            elements=[],
+        )
+    ]
+    report = await draft_tests(inv, _FakeProvider(), into=tmp_path)
+    assert len(report.written) == 1 and report.written[0].destructive is True
+    assert "pytestmark = pytest.mark.skip" in report.written[0].path.read_text()
+
+
+def test_http_mutates_flags_write_verbs_only():
+    from aitomation.write.generator import _http_mutates
+
+    assert _http_mutates("r = api_request_context.get('pets')\n    assert r.ok\n") is False
+    assert _http_mutates("api_request_context.delete(f'pets/{pid}')\n") is True
+    assert _http_mutates("api_request_context.post('pets', data={})\n") is True
+    assert _http_mutates("api_request_context.put('pets/1', data={})\n") is True
+
+
+async def test_draft_guards_invented_http_write_on_readonly_journey(tmp_path):
+    # A journey that references ONLY a GET element, but whose draft issues a DELETE (an invented
+    # cleanup). The inventory-level check sees only the GET; the code-level backstop must still
+    # guard the draft so the stray write can't run.
+    inv = _mutating_inv()
+    inv.suggested_journeys = [
+        Journey(
+            name="Read then clean",
+            description="list pets",
+            priority="high",
+            steps=[JourneyStep(action="list")],
+            elements=["list_pets"],
+        )
+    ]
+    sneaky = (
+        "def test_read(api_request_context):\n"
+        "    r = api_request_context.get('pets')\n"
+        "    assert r.ok\n"
+        "    api_request_context.delete('pets/1')  # invented cleanup\n"
+    )
+    report = await draft_tests(inv, _FakeProvider(code=sneaky), into=tmp_path)
+    assert len(report.written) == 1 and report.written[0].destructive is True
+    assert "pytestmark = pytest.mark.skip" in report.written[0].path.read_text()
 
 
 async def test_destructive_drafts_are_skipped_by_default(tmp_path):
@@ -274,7 +433,10 @@ def test_enable_draft_source_lifts_guard_and_is_idempotent():
 
 def test_enable_draft_source_preserves_pytest_import_when_body_needs_it():
     # The guard carried the only `import pytest`, but the body still uses pytest → keep it.
-    src = _SKIP_BLOCK + "def test_x(api_request_context):\n    with pytest.raises(ValueError):\n        pass\n"
+    src = (
+        _SKIP_BLOCK
+        + "def test_x(api_request_context):\n    with pytest.raises(ValueError):\n        pass\n"
+    )
     out, changed = enable_draft_source(src)
     assert changed and "pytestmark = pytest.mark.skip" not in out
     assert "import pytest" in out
@@ -320,11 +482,17 @@ def test_system_prompt_has_data_discipline():
 
 def test_build_prompt_surfaces_input_examples():
     inv = CoverageInventory(
-        system_name="X", base_url="https://x", source="openapi",
+        system_name="X",
+        base_url="https://x",
+        source="openapi",
         elements=[
             Element(
-                kind="endpoint", name="make", location="/things", method="POST",
-                description="create a thing", priority="high",
+                kind="endpoint",
+                name="make",
+                location="/things",
+                method="POST",
+                description="create a thing",
+                priority="high",
                 inputs=[InputField(name="title", where="body", required=True, example="Demo")],
             )
         ],
@@ -345,46 +513,72 @@ def test_destructive_prompt_asks_for_teardown():
 
 def test_lint_draft_rules():
     # API flow: must use the request fixture and have assertions
-    good_api = "def test_a(api_request_context):\n    r = api_request_context.get('x')\n    assert r.ok\n"
+    good_api = (
+        "def test_a(api_request_context):\n    r = api_request_context.get('x')\n    assert r.ok\n"
+    )
     assert lint_draft(good_api, web=False, api=True) == []
-    assert "api_request_context" in " ".join(lint_draft("def t():\n    assert 1", web=False, api=True))
+    assert "api_request_context" in " ".join(
+        lint_draft("def t():\n    assert 1", web=False, api=True)
+    )
 
     # web flow: must use a Page Object and Playwright expect()
     bad_web = "def test_w(page):\n    page.goto('/')\n    assert True\n"
     findings = lint_draft(bad_web, web=True, api=False)
     assert any("Page Object" in f for f in findings)
     assert any("expect()" in f for f in findings)
-    good_web = ("from pages import HomePage\nfrom playwright.sync_api import expect\n"
-                "def test_w(page):\n    home = HomePage(page).goto()\n    expect(page).to_have_title('x')\n")
+    good_web = (
+        "from pages import HomePage\nfrom playwright.sync_api import expect\n"
+        "def test_w(page):\n    home = HomePage(page).goto()\n    expect(page).to_have_title('x')\n"
+    )
     assert lint_draft(good_web, web=True, api=False) == []
 
     # importing a Page Object but never using it (the Goodhart hole) must be caught
-    imported_unused = ("from pages import HomePage\nfrom playwright.sync_api import expect\n"
-                       "def test_w(page):\n    page.goto('/')\n    expect(page).to_have_title('x')\n")
+    imported_unused = (
+        "from pages import HomePage\nfrom playwright.sync_api import expect\n"
+        "def test_w(page):\n    page.goto('/')\n    expect(page).to_have_title('x')\n"
+    )
     assert any("unused" in f for f in lint_draft(imported_unused, web=True, api=False))
 
     # importing TWO but using only ONE must flag the unused one by name
-    two_one = ("from pages import HomePage, BrandPage\nfrom playwright.sync_api import expect\n"
-               "def test_w(page):\n    BrandPage(page).goto()\n    expect(page).to_have_title('x')\n")
+    two_one = (
+        "from pages import HomePage, BrandPage\nfrom playwright.sync_api import expect\n"
+        "def test_w(page):\n    BrandPage(page).goto()\n    expect(page).to_have_title('x')\n"
+    )
     f = lint_draft(two_one, web=True, api=False)
     assert any("unused" in x and "HomePage" in x for x in f)
     assert not any("BrandPage" in x for x in f)  # the used one isn't flagged
 
     # using expect() without importing it is a (runtime) bug the lint must catch
-    expect_no_import = ("from pages import HomePage\ndef test_w(page):\n"
-                        "    HomePage(page).goto()\n    expect(page).to_have_title('x')\n")
+    expect_no_import = (
+        "from pages import HomePage\ndef test_w(page):\n"
+        "    HomePage(page).goto()\n    expect(page).to_have_title('x')\n"
+    )
     assert any("imports it" in f for f in lint_draft(expect_no_import, web=True, api=False))
 
     # hard sleeps are banned for any flow
-    assert any("sleep" in f for f in lint_draft("import time\ntime.sleep(1)\nassert 1", web=False, api=True))
+    assert any(
+        "sleep" in f
+        for f in lint_draft("import time\ntime.sleep(1)\nassert 1", web=False, api=True)
+    )
 
 
 def _web_inv() -> CoverageInventory:
     return CoverageInventory(
-        system_name="Web", base_url="https://web.demo", source="crawl",
-        elements=[Element(kind="page", name="Home", location="/", description="home", priority="high")],
-        suggested_journeys=[Journey(name="Visit home", description="d", priority="high",
-                                    steps=[JourneyStep(action="open")], elements=["Home"])],
+        system_name="Web",
+        base_url="https://web.demo",
+        source="crawl",
+        elements=[
+            Element(kind="page", name="Home", location="/", description="home", priority="high")
+        ],
+        suggested_journeys=[
+            Journey(
+                name="Visit home",
+                description="d",
+                priority="high",
+                steps=[JourneyStep(action="open")],
+                elements=["Home"],
+            )
+        ],
     )
 
 
@@ -473,8 +667,8 @@ def test_build_prompt_declares_journey_type():
 
 
 def test_draft_tests_verify_self_heals_failures(tmp_path):
-    from unittest.mock import patch, MagicMock
     import asyncio
+    from unittest.mock import MagicMock, patch
 
     # Code that compiles and passes lint rules
     ok_code = (
@@ -487,10 +681,14 @@ def test_draft_tests_verify_self_heals_failures(tmp_path):
     provider = _FakeProvider(code=ok_code)
 
     # 1st run: fails with AssertionError, 2nd run: passes
-    mock_run = MagicMock(side_effect=[(1, "AssertionError: expected 'x' but got 'y'"), (0, "Success")])
+    mock_run = MagicMock(
+        side_effect=[(1, "AssertionError: expected 'x' but got 'y'"), (0, "Success")]
+    )
 
     with patch("aitomation.write.generator.run_test_file", mock_run):
-        report = asyncio.run(draft_tests(_web_inv(), provider, into=tmp_path, max_journeys=1, verify=True))
+        report = asyncio.run(
+            draft_tests(_web_inv(), provider, into=tmp_path, max_journeys=1, verify=True)
+        )
 
         assert mock_run.call_count == 2
         assert len(report.written) == 1
@@ -510,14 +708,16 @@ _WEB_OK = (
 
 
 def test_draft_tests_verify_passing_test_no_retry(tmp_path):
-    from unittest.mock import patch, MagicMock
     import asyncio
+    from unittest.mock import MagicMock, patch
 
     provider = _FakeProvider(code=_WEB_OK)
     mock_run = MagicMock(side_effect=[(0, "1 passed")])
 
     with patch("aitomation.write.generator.run_test_file", mock_run):
-        report = asyncio.run(draft_tests(_web_inv(), provider, into=tmp_path, max_journeys=1, verify=True))
+        report = asyncio.run(
+            draft_tests(_web_inv(), provider, into=tmp_path, max_journeys=1, verify=True)
+        )
 
     # passes first time → no self-heal, only the initial generation call
     assert mock_run.call_count == 1
@@ -528,15 +728,17 @@ def test_draft_tests_verify_passing_test_no_retry(tmp_path):
 
 
 def test_draft_tests_verify_still_failing_kept_runnable_with_note(tmp_path):
-    from unittest.mock import patch, MagicMock
     import asyncio
+    from unittest.mock import MagicMock, patch
 
     provider = _FakeProvider(code=_WEB_OK)
     # fails, retry is adopted (clean code), still fails the second run
     mock_run = MagicMock(side_effect=[(1, "first trace"), (1, "TimeoutError: locator not found")])
 
     with patch("aitomation.write.generator.run_test_file", mock_run):
-        report = asyncio.run(draft_tests(_web_inv(), provider, into=tmp_path, max_journeys=1, verify=True))
+        report = asyncio.run(
+            draft_tests(_web_inv(), provider, into=tmp_path, max_journeys=1, verify=True)
+        )
 
     # syntactically valid & lint-clean → stays runnable, NOT quarantined
     assert len(report.written) == 1 and not report.quarantined
@@ -549,8 +751,8 @@ def test_draft_tests_verify_still_failing_kept_runnable_with_note(tmp_path):
 
 
 def test_draft_tests_verify_discards_regressing_retry(tmp_path):
-    from unittest.mock import patch, MagicMock
     import asyncio
+    from unittest.mock import MagicMock, patch
 
     # 1st draft is clean web code; the self-heal retry regresses into API-style code that
     # violates the web lint rules. The regressing retry must be discarded — the original
@@ -560,16 +762,43 @@ def test_draft_tests_verify_discards_regressing_retry(tmp_path):
     mock_run = MagicMock(side_effect=[(1, "AssertionError: boom")])
 
     with patch("aitomation.write.generator.run_test_file", mock_run):
-        report = asyncio.run(draft_tests(_web_inv(), provider, into=tmp_path, max_journeys=1, verify=True))
+        report = asyncio.run(
+            draft_tests(_web_inv(), provider, into=tmp_path, max_journeys=1, verify=True)
+        )
 
     assert len(report.written) == 1 and not report.quarantined
     assert report.written[0].runtime_failed is True
     # retry was generated (2 prompts) but never adopted, so the test is only run once
     assert len(provider.prompts) == 2 and mock_run.call_count == 1
     body = report.written[0].path.read_text()
-    assert "HomePage" in body and "api_request_context" not in body  # original kept, not the regression
+    assert (
+        "HomePage" in body and "api_request_context" not in body
+    )  # original kept, not the regression
     assert "RUNTIME FAILURE" in body and "AssertionError: boom" in body
     compile(body, str(report.written[0].path), "exec")
+
+
+def test_draft_tests_verify_skips_heal_on_setup_failure(tmp_path):
+    import asyncio
+    from unittest.mock import MagicMock, patch
+
+    # A browser-not-installed failure is environmental, not a draft bug — verify must NOT spend
+    # a self-heal call on it; it leaves the draft runnable with an actionable note instead.
+    provider = _FakeProvider(code=_WEB_OK)
+    mock_run = MagicMock(
+        side_effect=[(1, "Executable doesn't exist ... run `playwright install chromium`")]
+    )
+
+    with patch("aitomation.write.generator.run_test_file", mock_run):
+        report = asyncio.run(
+            draft_tests(_web_inv(), provider, into=tmp_path, max_journeys=1, verify=True)
+        )
+
+    # only the initial generation; no corrective heal call, the test was run once
+    assert mock_run.call_count == 1 and len(provider.prompts) == 1
+    assert len(report.written) == 1 and report.written[0].runtime_failed is True
+    body = report.written[0].path.read_text()
+    assert "VERIFY INCOMPLETE" in body and "playwright install" in body
 
 
 # -- heal_failing_tests (the interactive "f" fix) ---------------------------------------
@@ -584,8 +813,9 @@ def _write_test_file(into, stem: str, content: str):
 
 
 def test_heal_fixes_a_failing_test(tmp_path):
-    from unittest.mock import patch, MagicMock
     import asyncio
+    from unittest.mock import MagicMock, patch
+
     from aitomation.write import heal_failing_tests
 
     p = _write_test_file(tmp_path, "test_visit_home", "def test_w(page):\n    assert False\n")
@@ -605,8 +835,9 @@ def test_heal_fixes_a_failing_test(tmp_path):
 
 
 def test_heal_leaves_passing_tests_untouched(tmp_path):
-    from unittest.mock import patch, MagicMock
     import asyncio
+    from unittest.mock import MagicMock, patch
+
     from aitomation.write import heal_failing_tests
 
     original = "def test_w(page):\n    assert True\n"
@@ -623,8 +854,9 @@ def test_heal_leaves_passing_tests_untouched(tmp_path):
 
 
 def test_heal_still_failing_annotates_notes(tmp_path):
-    from unittest.mock import patch, MagicMock
     import asyncio
+    from unittest.mock import MagicMock, patch
+
     from aitomation.write import heal_failing_tests
 
     p = _write_test_file(tmp_path, "test_visit_home", "def test_w(page):\n    assert False\n")
@@ -642,8 +874,9 @@ def test_heal_still_failing_annotates_notes(tmp_path):
 
 
 def test_heal_discards_regressing_retry(tmp_path):
-    from unittest.mock import patch, MagicMock
     import asyncio
+    from unittest.mock import MagicMock, patch
+
     from aitomation.write import heal_failing_tests
 
     original = _WEB_OK
@@ -662,8 +895,9 @@ def test_heal_discards_regressing_retry(tmp_path):
 
 
 def test_heal_skips_destructive_and_skipped(tmp_path):
-    from unittest.mock import patch, MagicMock
     import asyncio
+    from unittest.mock import MagicMock, patch
+
     from aitomation.write import heal_failing_tests
 
     skip_src = (
@@ -684,8 +918,9 @@ def test_heal_skips_destructive_and_skipped(tmp_path):
 
 
 def test_heal_handles_renamed_journeys(tmp_path):
-    from unittest.mock import patch, MagicMock
     import asyncio
+    from unittest.mock import MagicMock, patch
+
     from aitomation.write import heal_failing_tests
 
     provider = _FakeProvider(code=_WEB_OK)
@@ -704,13 +939,15 @@ def test_heal_handles_renamed_journeys(tmp_path):
 
 
 def test_heal_grounds_from_failing_test_when_flow_unmatched(tmp_path):
-    from unittest.mock import patch, MagicMock
     import asyncio
+    from unittest.mock import MagicMock, patch
+
     from aitomation.write import heal_failing_tests
 
     # a test whose flow id + filename match nothing in the current inventory (regrouped/removed)
     _write_test_file(
-        tmp_path, "test_orphan",
+        tmp_path,
+        "test_orphan",
         "# AI FIRST-DRAFT\n# Journey: Orphan Flow — gone\n# Flow: deadbeef00\n\n\n"
         "def test_w(page):\n    assert False\n",
     )
@@ -725,45 +962,76 @@ def test_heal_grounds_from_failing_test_when_flow_unmatched(tmp_path):
     assert "# Flow: deadbeef00" in body  # original provenance preserved through the heal
 
 
-
-
 # -- backend surfaces: EVENT (message contracts) + DATA (db schema) ---------------------
 
 
 def _event_inv() -> CoverageInventory:
     return CoverageInventory(
-        system_name="Orders Events", base_url="kafka://broker", source="asyncapi",
+        system_name="Orders Events",
+        base_url="kafka://broker",
+        source="asyncapi",
         elements=[
-            Element(kind="topic", name="orderCreated", location="orders.created", method="receive",
-                    description="Order placed.", priority="high"),
-            Element(kind="event_schema", name="OrderCreated", location="orders.created",
-                    description="Order created event.", priority="high",
-                    inputs=[InputField(name="orderId", type="string", required=True, where="message")],
-                    json_schema={"type": "object", "required": ["orderId"],
-                                 "properties": {"orderId": {"type": "string"}}}),
+            Element(
+                kind="topic",
+                name="orderCreated",
+                location="orders.created",
+                method="receive",
+                description="Order placed.",
+                priority="high",
+            ),
+            Element(
+                kind="event_schema",
+                name="OrderCreated",
+                location="orders.created",
+                description="Order created event.",
+                priority="high",
+                inputs=[InputField(name="orderId", type="string", required=True, where="message")],
+                json_schema={
+                    "type": "object",
+                    "required": ["orderId"],
+                    "properties": {"orderId": {"type": "string"}},
+                },
+            ),
         ],
         suggested_journeys=[
-            Journey(name="OrderCreated conforms", description="validate a sample payload",
-                    priority="high", steps=[JourneyStep(action="build a sample and validate it")],
-                    elements=["OrderCreated"]),
+            Journey(
+                name="OrderCreated conforms",
+                description="validate a sample payload",
+                priority="high",
+                steps=[JourneyStep(action="build a sample and validate it")],
+                elements=["OrderCreated"],
+            ),
         ],
     )
 
 
 def _db_inv() -> CoverageInventory:
     return CoverageInventory(
-        system_name="Shop DB", base_url="sqlite:///shop.db", source="db_schema",
+        system_name="Shop DB",
+        base_url="sqlite:///shop.db",
+        source="db_schema",
         elements=[
-            Element(kind="table", name="users", location="users", description="Users table.",
-                    priority="high",
-                    inputs=[InputField(name="id", type="INTEGER", required=True, where="column"),
-                            InputField(name="email", type="TEXT", required=True, where="column")],
-                    preconditions=["PRIMARY KEY (id)", "UNIQUE (email)"]),
+            Element(
+                kind="table",
+                name="users",
+                location="users",
+                description="Users table.",
+                priority="high",
+                inputs=[
+                    InputField(name="id", type="INTEGER", required=True, where="column"),
+                    InputField(name="email", type="TEXT", required=True, where="column"),
+                ],
+                preconditions=["PRIMARY KEY (id)", "UNIQUE (email)"],
+            ),
         ],
         suggested_journeys=[
-            Journey(name="users constraints", description="assert the schema/constraints",
-                    priority="high", steps=[JourneyStep(action="introspect the users table")],
-                    elements=["users"]),
+            Journey(
+                name="users constraints",
+                description="assert the schema/constraints",
+                priority="high",
+                steps=[JourneyStep(action="introspect the users table")],
+                elements=["users"],
+            ),
         ],
     )
 
@@ -806,16 +1074,24 @@ def test_is_destructive_ignores_backend_journey_prose():
     # draft is read-only. Destructiveness for these is decided from generated code, not prose.
     ev = _event_inv()
     assert is_destructive(ev, ev.suggested_journeys[0]) is False
-    emit_prose = Journey(name="conformance", description="ensure producers emit valid payloads",
-                         priority="high", steps=[JourneyStep(action="publish a valid OrderCreated")],
-                         elements=["orderCreated"])
+    emit_prose = Journey(
+        name="conformance",
+        description="ensure producers emit valid payloads",
+        priority="high",
+        steps=[JourneyStep(action="publish a valid OrderCreated")],
+        elements=["orderCreated"],
+    )
     assert is_destructive(ev, emit_prose) is False  # prose alone never flags a topic
 
     db = _db_inv()
     assert is_destructive(db, db.suggested_journeys[0]) is False
-    insert_prose = Journey(name="constraints", description="verify the table rejects bad inserts",
-                           priority="high", steps=[JourneyStep(action="insert is rejected")],
-                           elements=["users"])
+    insert_prose = Journey(
+        name="constraints",
+        description="verify the table rejects bad inserts",
+        priority="high",
+        steps=[JourneyStep(action="insert is rejected")],
+        elements=["users"],
+    )
     assert is_destructive(db, insert_prose) is False
 
 
@@ -823,17 +1099,52 @@ def test_mutates_backend_flags_real_writes_only():
     from aitomation.write.generator import _mutates_backend
 
     # read-only contract code → not a mutation
-    assert _mutates_backend(
-        "def t(message_schema):\n    import jsonschema\n"
-        "    jsonschema.validate(instance={}, schema=message_schema('A'))\n"
-    ) is False
-    assert _mutates_backend(
-        "def t(db_inspector):\n    assert 'users' in db_inspector.get_table_names()\n"
-    ) is False
+    assert (
+        _mutates_backend(
+            "def t(message_schema):\n    import jsonschema\n"
+            "    jsonschema.validate(instance={}, schema=message_schema('A'))\n"
+        )
+        is False
+    )
+    assert (
+        _mutates_backend(
+            "def t(db_inspector):\n    assert 'users' in db_inspector.get_table_names()\n"
+        )
+        is False
+    )
     # actual DML / commit → mutation
-    assert _mutates_backend("conn.execute(text('INSERT INTO users VALUES (1)'))\nconn.commit()") is True
+    assert (
+        _mutates_backend("conn.execute(text('INSERT INTO users VALUES (1)'))\nconn.commit()")
+        is True
+    )
     # actual broker publish → mutation
     assert _mutates_backend("producer.produce('orders', value=b'x')") is True
+
+    # prose in a DOCSTRING or COMMENT must NOT false-positive — only executable code is scanned
+    assert (
+        _mutates_backend(
+            "def test_x(db_inspector):\n"
+            '    """Verify the table rejects bad inserts and an UPDATE without a WHERE."""\n'
+            "    # delete from is described, not performed\n"
+            "    assert 'users' in db_inspector.get_table_names()\n"
+        )
+        is False
+    )
+
+
+def test_http_mutates_ignores_prose_in_comments():
+    from aitomation.write.generator import _http_mutates
+
+    # a comment mentioning a write verb is not a real call
+    assert (
+        _http_mutates(
+            "def test_x(api_request_context):\n"
+            "    # could call api_request_context.delete(...) for cleanup, but we don't\n"
+            "    r = api_request_context.get('pets')\n"
+            "    assert r.ok\n"
+        )
+        is False
+    )
 
 
 def test_system_prompt_documents_event_and_data():

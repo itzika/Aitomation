@@ -146,7 +146,7 @@ def _reflect_table(insp, tname: str) -> TableInfo:
     try:
         for c in insp.get_check_constraints(tname):
             constraints.append(f"CHECK {c.get('sqltext', '')}".strip())
-    except Exception:  # noqa: BLE001 — some dialects don't support check reflection
+    except Exception:
         pass
     return TableInfo(name=tname, columns=columns, constraints=constraints)
 
@@ -185,9 +185,15 @@ def parse_ddl(text: str, *, dialect: str | None = None) -> list[TableInfo]:
 
         for e in schema_node.expressions:
             if isinstance(e, exp.ColumnDef):
-                is_pk = any(isinstance(c.kind, exp.PrimaryKeyColumnConstraint) for c in e.constraints)
-                not_null = any(isinstance(c.kind, exp.NotNullColumnConstraint) for c in e.constraints)
-                is_unique = any(isinstance(c.kind, exp.UniqueColumnConstraint) for c in e.constraints)
+                is_pk = any(
+                    isinstance(c.kind, exp.PrimaryKeyColumnConstraint) for c in e.constraints
+                )
+                not_null = any(
+                    isinstance(c.kind, exp.NotNullColumnConstraint) for c in e.constraints
+                )
+                is_unique = any(
+                    isinstance(c.kind, exp.UniqueColumnConstraint) for c in e.constraints
+                )
                 columns.append(
                     ColumnInfo(
                         name=e.name,

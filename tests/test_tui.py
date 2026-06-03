@@ -6,6 +6,7 @@ Discovery/write themselves are covered by their own module tests."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from textual.widgets import DataTable, Input, RadioButton, RadioSet
@@ -16,8 +17,14 @@ from aitomation.tui import AitomationApp, Workspace
 from aitomation.tui.app import ConfirmScreen, HelpScreen, ModelScreen, WizardScreen
 
 _LLM_ENV = (
-    "AITOMATION_PROVIDER", "AITOMATION_MODEL", "AITOMATION_API_KEY", "AITOMATION_BASE_URL",
-    "AITOMATION_OUTPUT_MODE", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DASHSCOPE_API_KEY",
+    "AITOMATION_PROVIDER",
+    "AITOMATION_MODEL",
+    "AITOMATION_API_KEY",
+    "AITOMATION_BASE_URL",
+    "AITOMATION_OUTPUT_MODE",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "DASHSCOPE_API_KEY",
 )
 
 
@@ -31,12 +38,27 @@ class _FakeLLM:
 
 def _seed(root: Path) -> None:
     inv = CoverageInventory(
-        system_name="Demo API", base_url="https://api.demo", source="openapi", auth_strategy="bearer",
+        system_name="Demo API",
+        base_url="https://api.demo",
+        source="openapi",
+        auth_strategy="bearer",
         elements=[
-            Element(kind="endpoint", name="getThing", location="/things/{id}", method="GET",
-                    description="read a thing", priority="high"),
-            Element(kind="endpoint", name="listThings", location="/things", method="GET",
-                    description="list things", priority="medium"),
+            Element(
+                kind="endpoint",
+                name="getThing",
+                location="/things/{id}",
+                method="GET",
+                description="read a thing",
+                priority="high",
+            ),
+            Element(
+                kind="endpoint",
+                name="listThings",
+                location="/things",
+                method="GET",
+                description="list things",
+                priority="medium",
+            ),
         ],
         suggested_journeys=[
             Journey(name="Read a thing", description="d", priority="high", elements=["getThing"])
@@ -177,6 +199,7 @@ async def test_fix_action_gated_until_a_run_fails(tmp_path):
 
 async def test_fix_runs_heal_and_clears_flag(tmp_path):
     from unittest.mock import patch
+
     from aitomation.write import HealReport, HealResult
 
     _seed(tmp_path)
@@ -188,7 +211,9 @@ async def test_fix_runs_heal_and_clears_flag(tmp_path):
         app._last_run_failed = True  # pretend the last pytest run had failures
 
         run = Path(app.current.latest_run)
-        healed = HealReport(fixed=[HealResult("Read a thing", run / "tests" / "test_x.py", fixed=True)])
+        healed = HealReport(
+            fixed=[HealResult("Read a thing", run / "tests" / "test_x.py", fixed=True)]
+        )
 
         async def fake_heal(inv, provider, *, into, **kw):
             assert Path(into) == run  # heals the current run dir
@@ -385,7 +410,9 @@ async def test_enable_action_cancel_keeps_skip(tmp_path):
         await pilot.pause()
         run = Path(app.current.latest_run)
         skipped = run / "tests" / "test_create_thing.py"
-        skipped.write_text(_SKIP_BLOCK + "def test_create_thing(api_request_context):\n    assert True\n")
+        skipped.write_text(
+            _SKIP_BLOCK + "def test_create_thing(api_request_context):\n    assert True\n"
+        )
         app._render_tests()
         await pilot.pause()
         idx = next(i for i, (_n, s, _p) in enumerate(app._test_files) if "skip" in s)
@@ -398,7 +425,9 @@ async def test_enable_action_cancel_keeps_skip(tmp_path):
         assert "mark.skip" in skipped.read_text()
 
 
-async def test_model_picker_opens_and_closes(tmp_path):
+async def test_model_picker_opens_and_closes(tmp_path, monkeypatch):
+    for var in _LLM_ENV:  # no key → the on-open model fetch short-circuits (no network)
+        monkeypatch.delenv(var, raising=False)
     _seed(tmp_path)
     app = _app(tmp_path)
     async with app.run_test() as pilot:
@@ -411,9 +440,11 @@ async def test_model_picker_opens_and_closes(tmp_path):
         assert not isinstance(app.screen, ModelScreen)
 
 
-async def test_clicking_title_bar_opens_model_picker(tmp_path):
+async def test_clicking_title_bar_opens_model_picker(tmp_path, monkeypatch):
     from aitomation.tui.app import MatrixBanner
 
+    for var in _LLM_ENV:
+        monkeypatch.delenv(var, raising=False)
     _seed(tmp_path)
     app = _app(tmp_path)
     async with app.run_test() as pilot:
@@ -421,6 +452,34 @@ async def test_clicking_title_bar_opens_model_picker(tmp_path):
         await pilot.click(MatrixBanner)  # centre of the band == the title row -> model picker
         await pilot.pause()
         assert isinstance(app.screen, ModelScreen)
+
+
+async def test_model_picker_lists_and_filters_models(tmp_path, monkeypatch):
+    from textual.widgets import Input, OptionList
+
+    for var in _LLM_ENV:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")  # so the listing has credentials
+    # stub the network: the picker fetches the provider's models via providers.list_models
+    monkeypatch.setattr(
+        "aitomation.tui.app.list_models",
+        lambda cfg, **k: ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"],
+    )
+    _seed(tmp_path)
+    app = _app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("m")
+        await pilot.pause()
+        await pilot.pause()  # let the fetch worker resolve and populate the list
+        screen = app.screen
+        assert isinstance(screen, ModelScreen)
+        ol = screen.query_one("#model-list", OptionList)
+        assert ol.option_count == 3
+        # typing filters the list to matches
+        screen.query_one("#model-name", Input).value = "sonnet"
+        await pilot.pause()
+        assert ol.option_count == 1
 
 
 async def test_model_choice_applies(tmp_path, monkeypatch):
@@ -448,6 +507,41 @@ async def test_model_choice_rejects_backend_without_key(tmp_path, monkeypatch):
         await pilot.pause()
         assert app.sub_title == "before"  # unchanged
         assert app._config is None  # nothing applied
+
+
+async def test_stage_model_override_routes_per_stage(tmp_path, monkeypatch):
+    for var in _LLM_ENV:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    app = _app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._apply_model_choice("anthropic", "claude-opus-4-8")  # the default for every stage
+        # pin a different model just for the fix stage
+        app._apply_stage_model("fix", "openai", "gpt-4.1")
+        await pilot.pause()
+
+        assert app._stage_cfg["fix"].backend == "openai"
+        # fix routes to its own provider; write/discover fall back to the default
+        assert app._provider_for("fix") is app._stage_llm["fix"]
+        assert app._provider_for("write") is app._llm
+        assert app._provider_for("discover") is app._llm
+        assert app._provider_for("fix") is not app._provider_for("write")
+
+
+async def test_stage_model_override_rejected_without_key(tmp_path, monkeypatch):
+    for var in _LLM_ENV:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    app = _app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._apply_model_choice("anthropic", "claude-opus-4-8")
+        app._apply_stage_model("write", "dashscope", "qwen-plus")  # no DASHSCOPE_API_KEY
+        await pilot.pause()
+        assert "write" not in app._stage_cfg  # rejected, nothing pinned
+        assert app._provider_for("write") is app._llm  # still the default
 
 
 def test_find_app_bundle_prefers_exact_then_prefix(tmp_path):
@@ -485,9 +579,10 @@ def test_resolve_editor_non_macos_uses_cli(monkeypatch):
 
 
 async def test_open_editor_shows_picker(tmp_path, monkeypatch):
+    from textual.widgets import Button
+
     import aitomation.tui.app as appmod
     from aitomation.tui.app import EditorScreen
-    from textual.widgets import Button
 
     # only VS Code installed; the rest must appear disabled
     def fake_resolve(cli, apps):
@@ -587,9 +682,19 @@ async def _run_one_discover(app, pilot, source: str, origin: str, fn_name: str) 
     async def fake(origin_, provider):
         called["origin"] = origin_
         return CoverageInventory(
-            system_name=f"X-{origin_}", base_url=origin_, source="openapi",
-            elements=[Element(kind="endpoint", name="e", location="/e", method="GET",
-                              description="x", priority="low")],
+            system_name=f"X-{origin_}",
+            base_url=origin_,
+            source="openapi",
+            elements=[
+                Element(
+                    kind="endpoint",
+                    name="e",
+                    location="/e",
+                    method="GET",
+                    description="x",
+                    priority="low",
+                )
+            ],
         )
 
     with patch(f"aitomation.tui.app.{fn_name}", fake):
@@ -603,12 +708,22 @@ async def test_tui_dispatches_new_discovery_sources(tmp_path):
     app = _app(tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
-        assert (await _run_one_discover(app, pilot, "asyncapi", "a.yaml", "discover_asyncapi"))["origin"] == "a.yaml"
-        assert (await _run_one_discover(app, pilot, "registry", "http://r", "discover_registry"))["origin"] == "http://r"
-        assert (await _run_one_discover(app, pilot, "db", "x.sql", "discover_db"))["origin"] == "x.sql"
+        assert (await _run_one_discover(app, pilot, "asyncapi", "a.yaml", "discover_asyncapi"))[
+            "origin"
+        ] == "a.yaml"
+        assert (await _run_one_discover(app, pilot, "registry", "http://r", "discover_registry"))[
+            "origin"
+        ] == "http://r"
+        assert (await _run_one_discover(app, pilot, "db", "x.sql", "discover_db"))[
+            "origin"
+        ] == "x.sql"
         # re-discover passes the inventory's DiscoverySource — both forms must route correctly
-        assert (await _run_one_discover(app, pilot, "schema_registry", "http://r2", "discover_registry"))["origin"] == "http://r2"
-        assert (await _run_one_discover(app, pilot, "db_schema", "y.sql", "discover_db"))["origin"] == "y.sql"
+        assert (
+            await _run_one_discover(app, pilot, "schema_registry", "http://r2", "discover_registry")
+        )["origin"] == "http://r2"
+        assert (await _run_one_discover(app, pilot, "db_schema", "y.sql", "discover_db"))[
+            "origin"
+        ] == "y.sql"
 
 
 async def test_header_banner_animates_folds_and_pauses(tmp_path):
@@ -642,3 +757,300 @@ async def test_header_banner_animates_folds_and_pauses(tmp_path):
         app._set_banner_paused(False)
         banner._tick()
         assert banner._phase != frozen
+
+
+# -- Usage tab: cost model + meters + collapsible runs ----------------------------------
+
+
+def test_usage_price_and_cost_helpers():
+    from aitomation.tui.app import _cost_of, _price_for, _stage_of
+
+    # model-FAMILY matching: versioned names resolve without an exact table
+    assert _price_for("anthropic", "claude-opus-4-8") == (15.0, 75.0)
+    assert _price_for("anthropic", "claude-sonnet-4-6") == (3.0, 15.0)
+    assert _price_for("dashscope", "qwen-plus-latest") == (0.4, 1.2)
+    assert _price_for("dashscope", "qwen3-max") == (1.6, 6.4)
+    assert _price_for("local", "some-unknown-7b") is None  # unknown -> no price
+
+    # cost = in/1e6*in_rate + out/1e6*out_rate; unknown models contribute 0
+    rec = {
+        "provider": "anthropic",
+        "model": "claude-opus-4-8",
+        "input_tokens": 1_000_000,
+        "output_tokens": 1_000_000,
+    }
+    assert _cost_of(rec) == 90.0
+    assert (
+        _cost_of({"provider": "x", "model": "mystery", "input_tokens": 5, "output_tokens": 5})
+        == 0.0
+    )
+
+    assert _stage_of("discover.crawl") == "discover"
+    assert _stage_of("write:test_x") == "write"
+    assert _stage_of("fix:test_x") == "fix"
+    assert _stage_of("something-else") == "other"
+
+
+def test_cost_includes_cached_tokens():
+    from aitomation.tui.app import _cost_of
+
+    # opus input rate = $15/M. Cached input is billed apart: read ~0.1x, write ~1.25x.
+    rec = {
+        "provider": "anthropic",
+        "model": "claude-opus-4-8",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 1_000_000,  # 1M * 15 * 0.1  = 1.5
+        "cache_write_tokens": 1_000_000,  # 1M * 15 * 1.25 = 18.75
+    }
+    assert _cost_of(rec) == 1.5 + 18.75
+    # records without cache fields are unaffected (back-compat with pre-cache logs)
+    no_cache = {
+        "provider": "anthropic",
+        "model": "claude-opus-4-8",
+        "input_tokens": 1_000_000,
+        "output_tokens": 0,
+    }
+    assert _cost_of(no_cache) == 15.0
+
+
+def test_usage_bar_and_sparkline_helpers():
+    from aitomation.tui.app import _ascii_bar, _bar, _sparkline
+
+    assert _bar(0.0, 10, "x").plain == "░" * 10  # empty -> full track
+    assert _bar(1.0, 10, "x").plain == "█" * 10  # full -> no track, no overflow
+    assert len(_bar(0.37, 10, "x").plain) == 10  # always exactly `width` cells
+
+    assert _sparkline([]) == ""
+    assert _sparkline([1, 2, 3])[-1] == "█"  # the max maps to the tallest glyph
+    assert _sparkline([5, 5, 5], scale=0.0) == "▁▁▁"  # scaled to nothing -> baseline
+
+    assert _ascii_bar(0.0) == "░" * 8 and _ascii_bar(1.0) == "█" * 8
+
+
+def _usage_record(
+    app: str,
+    run_id: str,
+    label: str,
+    provider: str,
+    model: str,
+    in_tok: int,
+    out_tok: int,
+    *,
+    started: str = "2026-06-02T18:17:00+00:00",
+) -> dict:
+    return {
+        "run_id": run_id,
+        "app": app,
+        "label": label,
+        "provider": provider,
+        "model": model,
+        "input_tokens": in_tok,
+        "output_tokens": out_tok,
+        "total_tokens": in_tok + out_tok,
+        "cache_read_tokens": 0,
+        "requests": 1,
+        "duration_s": 2.0,
+        "started_at": started,
+        "ended_at": started,
+        "ok": True,
+        "error": None,
+        "system_prompt": "",
+        "user_prompt": "",
+    }
+
+
+def test_usage_data_groups_runs_models_and_stages():
+    from aitomation.tui.app import AitomationApp
+
+    recs = [
+        _usage_record(
+            "Demo API",
+            "runA",
+            "discover.openapi",
+            "dashscope",
+            "qwen-plus",
+            1000,
+            200,
+            started="2026-06-01T10:00:00+00:00",
+        ),
+        _usage_record(
+            "Demo API",
+            "runB",
+            "write:test_x",
+            "anthropic",
+            "claude-opus-4-8",
+            2000,
+            500,
+            started="2026-06-02T10:00:00+00:00",
+        ),
+        _usage_record(
+            "Demo API",
+            "runB",
+            "fix:test_x",
+            "anthropic",
+            "claude-opus-4-8",
+            500,
+            100,
+            started="2026-06-02T10:05:00+00:00",
+        ),
+    ]
+    d = AitomationApp._usage_data(recs)
+
+    assert d["calls"] == 3 and d["total"] == 4300
+    # two runs, newest first; the spark series is chronological (oldest -> newest)
+    assert len(d["runs"]) == 2 and d["runs"][0]["id"] == "runB"
+    assert d["spark"] == [1200, 3100]
+    # models ranked by tokens used (opus run is larger than the qwen run)
+    assert d["models"][0] == "claude-opus-4-8" and "qwen-plus" in d["models"]
+    # stages present in pipeline order, each summing its labels' tokens
+    assert d["stages"] == [("discover", 1200), ("write", 2500), ("fix", 600)]
+    # cost only counts priced models (opus run); qwen is priced too here so cost > 0
+    assert d["cost"] > 0 and d["unpriced"] == 0
+
+
+def test_usage_run_rows_show_per_stage_model():
+    import io
+
+    from rich.console import Console
+
+    from aitomation.tui.app import AitomationApp
+
+    # one session run: write on Qwen, fix on Claude — the per-row breakdown must name each model
+    recs = [
+        _usage_record("Demo API", "runB", "write:test_x", "dashscope", "qwen-plus", 2000, 500),
+        _usage_record("Demo API", "runB", "fix:test_x", "anthropic", "claude-sonnet-4-6", 500, 100),
+    ]
+    run = AitomationApp._usage_data(recs)["runs"][0]
+    by_label = {r["label"]: r["model"] for r in run["rows"]}
+    assert by_label["write:test_x"] == "qwen-plus"
+    assert by_label["fix:test_x"] == "claude-sonnet-4-6"
+
+    buf = io.StringIO()
+    Console(file=buf, width=160).print(AitomationApp._run_table(run))
+    text = buf.getvalue()
+    assert "qwen-plus" in text and "claude-sonnet-4-6" in text
+
+
+async def test_usage_tab_empty_without_records(tmp_path):
+    from textual.widgets import Collapsible
+
+    from aitomation.tui.app import UsageMeters
+
+    _seed(tmp_path)
+    app = _app(tmp_path)  # usage log path doesn't exist -> no records
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # no meters / no run collapsibles, just the empty-state note
+        assert not app.query(UsageMeters) and not app.query(Collapsible)
+        assert "No LLM usage recorded" in app.query_one(".usage-empty").render().plain
+
+
+async def test_usage_tab_renders_meters_and_collapsible_runs(tmp_path):
+    from textual.widgets import Collapsible
+
+    from aitomation.tui.app import UsageMeters
+
+    _seed(tmp_path)
+    log = tmp_path / "u.jsonl"
+    log.write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in [
+                _usage_record(
+                    "Demo API",
+                    "runA",
+                    "discover.openapi",
+                    "dashscope",
+                    "qwen-plus",
+                    1000,
+                    200,
+                    started="2026-06-01T10:00:00+00:00",
+                ),
+                _usage_record(
+                    "Demo API",
+                    "runB",
+                    "write:test_x",
+                    "anthropic",
+                    "claude-opus-4-8",
+                    2000,
+                    500,
+                    started="2026-06-02T10:00:00+00:00",
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    app = AitomationApp(llm=_FakeLLM(), usage_log=log, workspace_root=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        meters = app.query_one(UsageMeters)
+        # exact models surfaced as chips, and a collapsible per run (newest expanded)
+        assert "claude-opus-4-8" in meters.render().plain
+        runs = app.query(Collapsible)
+        assert len(runs) == 2
+        assert runs.first().collapsed is False and runs[1].collapsed is True
+        # re-selecting the same system must REPLACE, not accumulate, the run widgets
+        app._select_system(0)
+        await pilot.pause()
+        assert len(app.query(Collapsible)) == 2
+
+
+async def test_usage_tab_includes_discover_records_filed_under_origin(tmp_path):
+    # During discover the recorder is keyed by ORIGIN; write/fix are keyed by system name.
+    # The per-system Usage view must fold both in, so discovery cost isn't silently dropped.
+    from aitomation.tui.app import UsageMeters
+
+    _seed(tmp_path)  # system "Demo API", origin "petstore.json"
+    log = tmp_path / "u.jsonl"
+    log.write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in [
+                _usage_record(
+                    "petstore.json", "runA", "discover.openapi", "dashscope", "qwen-plus", 4000, 800
+                ),
+                _usage_record(
+                    "Demo API", "runB", "write:test_x", "anthropic", "claude-opus-4-8", 2000, 500
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    app = AitomationApp(llm=_FakeLLM(), usage_log=log, workspace_root=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        d = app._usage_data(app._records_for_current())
+        # both the origin-tagged discover run and the name-tagged write run are present
+        assert d["calls"] == 2 and {s for s, _ in d["stages"]} == {"discover", "write"}
+        assert d["stages"][0] == ("discover", 4800)
+        assert app.query_one(UsageMeters)._data["total"] == 7300
+
+
+async def test_usage_meters_animation_settles(tmp_path):
+    from aitomation.tui.app import UsageMeters
+
+    _seed(tmp_path)
+    log = tmp_path / "u.jsonl"
+    log.write_text(
+        json.dumps(
+            _usage_record(
+                "Demo API", "runA", "discover.openapi", "dashscope", "qwen-plus", 1000, 200
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    app = AitomationApp(llm=_FakeLLM(), usage_log=log, workspace_root=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        meters = app.query_one(UsageMeters)
+        # the fill-in advances on tick and stops itself at full (no perpetual timer)
+        meters._anim = 0.0
+        meters._tick()
+        assert 0.0 < meters._anim < 1.0
+        for _ in range(20):
+            meters._tick()
+        assert meters._anim == 1.0 and meters._timer is None

@@ -83,7 +83,7 @@ class LLMConfig:
     output_mode: OutputMode = "tool"
 
     @classmethod
-    def from_env(cls, *, backend: str | None = None, model: str | None = None) -> "LLMConfig":
+    def from_env(cls, *, backend: str | None = None, model: str | None = None) -> LLMConfig:
         """Build config from environment, with optional explicit overrides (e.g. CLI flags)."""
         chosen = (backend or os.getenv("AITOMATION_PROVIDER") or "anthropic").strip()
         if chosen not in _DEFAULT_MODEL:
@@ -137,6 +137,4 @@ class LLMConfig:
         needs_key = self.backend in ("anthropic", "openai", "dashscope")
         if needs_key and not self.api_key:
             envs = " or ".join(("AITOMATION_API_KEY", *_KEY_ENV[self.backend]))
-            raise ConfigError(
-                f"No API key for provider {self.backend!r}. Set {envs}."
-            )
+            raise ConfigError(f"No API key for provider {self.backend!r}. Set {envs}.")

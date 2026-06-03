@@ -14,16 +14,17 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 DEFAULT_LOG = os.environ.get("AITOMATION_USAGE_LOG", "usage.jsonl")
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 @dataclass(slots=True)
@@ -40,6 +41,7 @@ class CallRecord:
     output_tokens: int
     total_tokens: int
     cache_read_tokens: int
+    cache_write_tokens: int
     requests: int
     duration_s: float
     started_at: str
@@ -102,6 +104,7 @@ class UsageRecorder:
             output_tokens=output_tokens,
             total_tokens=input_tokens + output_tokens,
             cache_read_tokens=int(getattr(usage, "cache_read_tokens", 0) or 0),
+            cache_write_tokens=int(getattr(usage, "cache_write_tokens", 0) or 0),
             requests=int(getattr(usage, "requests", 0) or 0),
             duration_s=round(duration_s, 3),
             started_at=started_at,
@@ -117,7 +120,7 @@ class UsageRecorder:
     def flush(self) -> Path:
         """Append not-yet-written records to the JSONL log. Safe to call repeatedly across a
         long session — only new records are appended each time."""
-        pending = self.records[self._flushed:]
+        pending = self.records[self._flushed :]
         if not pending:
             return self.log_path
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -155,17 +158,21 @@ def load_records(log_path: str | Path) -> list[dict[str, Any]]:
     return out
 
 
-def aggregate(
-    records: Iterable[dict[str, Any]], by: tuple[str, ...]
-) -> list[dict[str, Any]]:
+def aggregate(records: Iterable[dict[str, Any]], by: tuple[str, ...]) -> list[dict[str, Any]]:
     """Group records by the given keys and sum token/latency metrics."""
     groups: dict[tuple, dict[str, Any]] = {}
     for r in records:
         key = tuple(str(r.get(k, "")) for k in by)
         g = groups.setdefault(
             key,
-            {**{k: r.get(k, "") for k in by}, "calls": 0,
-             "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "duration_s": 0.0},
+            {
+                **{k: r.get(k, "") for k in by},
+                "calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "duration_s": 0.0,
+            },
         )
         g["calls"] += 1
         g["input_tokens"] += int(r.get("input_tokens", 0))

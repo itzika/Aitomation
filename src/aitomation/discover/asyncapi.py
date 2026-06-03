@@ -105,7 +105,9 @@ def _payload_fields(payload: dict[str, Any]) -> list[dict[str, Any]]:
     for pname, pschema in list(props.items())[:MAX_MESSAGE_PROPS]:
         ptype = pschema.get("type", "object") if isinstance(pschema, dict) else "object"
         example = pschema.get("example") if isinstance(pschema, dict) else None
-        out.append({"name": pname, "type": ptype, "required": pname in required, "example": example})
+        out.append(
+            {"name": pname, "type": ptype, "required": pname in required, "example": example}
+        )
     return out
 
 
@@ -195,7 +197,9 @@ def _summarize_v2(spec: dict[str, Any], summary: AsyncSummary) -> None:
                 continue
             ch.operations.append(op)
             for raw in _messages_from_node(opnode.get("message")):
-                key = _collect_message(spec, raw, chname, summary.messages, fallback=f"{chname}_{op}")
+                key = _collect_message(
+                    spec, raw, chname, summary.messages, fallback=f"{chname}_{op}"
+                )
                 if key and key not in ch.message_names:
                     ch.message_names.append(key)
         summary.channels.append(ch)

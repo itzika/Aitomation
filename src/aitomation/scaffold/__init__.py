@@ -4,4 +4,4 @@ auth_strategy) already happened during Discover, so generation is fully reproduc
 
 from .generator import inventory_to_context, scaffold_project
 
-__all__ = ["scaffold_project", "inventory_to_context"]
+__all__ = ["inventory_to_context", "scaffold_project"]
