@@ -5,6 +5,8 @@ The unit suite otherwise imports submodules directly, so an import-time error in
 
 from __future__ import annotations
 
+import re
+
 from typer.testing import CliRunner
 
 from aitomation.cli import app
@@ -14,6 +16,15 @@ from aitomation.workspace import Workspace
 from aitomation.write.generator import _SKIP_BLOCK
 
 runner = CliRunner()
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(result) -> str:
+    """Help output with ANSI styling stripped. Typer's option highlighter splits flag tokens
+    like `--force` with colour spans when colour is forced (CI sets FORCE_COLOR, which Rich
+    honours over NO_COLOR), so a raw substring check on the styled output is brittle."""
+    return _ANSI.sub("", result.output)
 
 
 def _inventory_file(tmp_path, name="Rick & Morty API"):
@@ -41,8 +52,9 @@ def _inventory_file(tmp_path, name="Rick & Morty API"):
 def test_cli_help_lists_all_commands():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
+    out = _plain(result)
     for command in ("discover", "scaffold", "write", "usage", "tui", "version"):
-        assert command in result.output
+        assert command in out
 
 
 def test_cli_version():
@@ -54,20 +66,22 @@ def test_cli_version():
 def test_discover_subcommands_present():
     result = runner.invoke(app, ["discover", "--help"])
     assert result.exit_code == 0
+    out = _plain(result)
     for sub in ("openapi", "crawl", "asyncapi", "registry", "db"):
-        assert sub in result.output
+        assert sub in out
 
 
 def test_discover_db_help_documents_both_modes():
     result = runner.invoke(app, ["discover", "db", "--help"])
     assert result.exit_code == 0
-    assert "DDL" in result.output or ".sql" in result.output
+    out = _plain(result)
+    assert "DDL" in out or ".sql" in out
 
 
 def test_write_help_has_force_flag():
     result = runner.invoke(app, ["write", "--help"])
     assert result.exit_code == 0
-    assert "--force" in result.output
+    assert "--force" in _plain(result)
 
 
 def test_cli_try_load_inventory_reads_baseline(tmp_path):

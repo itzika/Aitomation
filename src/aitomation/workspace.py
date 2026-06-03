@@ -119,9 +119,11 @@ class Workspace:
         the spec URL a prior discover recorded. Pass an explicit value to override."""
         slug = slugify(inv.system_name)
         prev = self._read_meta(slug)
-        resolved_origin = (
-            origin if origin is not None else ((prev and prev.get("origin")) or inv.base_url)
-        )
+        resolved_origin = origin if origin is not None else inv.base_url
+        if origin is None and prev:
+            prior = prev.get("origin")
+            if isinstance(prior, str) and prior:
+                resolved_origin = prior  # preserve a prior discover's origin on upsert
         record = SystemRecord(
             slug=slug,
             name=inv.system_name,
