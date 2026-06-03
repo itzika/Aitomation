@@ -105,7 +105,7 @@ A system moves through three stages, shown as dots in the library: \
   f   fix: self-heal the tests that just failed (one corrective retry each)
   e   enable the selected skipped (destructive) draft — review + add teardown first
   o   open the run folder — pick VS Code / PyCharm / Cursor / Antigravity
-  m   change the provider/model (or click the title in the header)
+  m   change the provider/model — apply to the default or one stage (discover/write/fix)
   d   delete the selected system
   l   toggle the live log
   b   fold / unfold the animated header banner
@@ -126,6 +126,11 @@ A system moves through three stages, shown as dots in the library: \
 
 
 _BACKENDS: tuple[str, ...] = get_args(Backend)
+
+# The LLM-using pipeline stages a model can be pinned to (scaffold is deterministic, no LLM).
+# `default` is the fallback for any stage left unset.
+_MODEL_STAGES: tuple[str, ...] = ("discover", "write", "fix")
+_MODEL_TARGETS: tuple[str, ...] = ("default", *_MODEL_STAGES)
 
 # Colour the Tests-tab status so pass/fail/skip read at a glance.
 _STATUS_STYLE = {
@@ -588,9 +593,13 @@ class UsageMeters(Static):
 
 
 class ModelScreen(ModalScreen[dict | None]):
-    """Pick the provider + model the toolkit talks to. The header shows the active one;
+    """Pick the provider + model the toolkit talks to. The header shows the active default;
     clicking it (or pressing m) opens this. Switching is BYO-key: a backend with no key
     configured is rejected with a message rather than silently failing later.
+
+    An `apply to` selector targets the default or a single pipeline stage (discover / write /
+    fix), so you can draft on a cheap model and self-heal on a stronger one. Switching target
+    loads that target's current backend/model into the fields.
 
     The provider's available models are pulled live from its `/models` endpoint and shown as a
     type-to-filter list, so you can pick (e.g.) one of Qwen's 100+ models without knowing the
@@ -599,24 +608,30 @@ class ModelScreen(ModalScreen[dict | None]):
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
-    def __init__(self, current_backend: str, current_model: str) -> None:
+    def __init__(self, assignments: dict[str, dict[str, str]]) -> None:
         super().__init__()
-        self._backend = current_backend
-        self._model = current_model
+        # {target -> {"backend", "model"}} for "default" + each stage; the value the fields show.
+        self._assignments = assignments
         self._models: list[str] = []  # last fetched, unfiltered
+        self._suppress = False  # ignore the RadioSet.Changed churn while reloading a target
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="model-picker"):
+        default = self._assignments["default"]
+        with VerticalScroll(id="model-picker"):
             yield Label("◢ select provider & model", id="model-title")
+            yield Label("apply to", classes="wizard-label")
+            with RadioSet(id="target"):
+                for t in _MODEL_TARGETS:
+                    yield RadioButton(t, value=(t == "default"))
             yield Label("provider", classes="wizard-label")
             with RadioSet(id="backend"):
                 for b in _BACKENDS:
-                    yield RadioButton(b, value=(b == self._backend))
+                    yield RadioButton(b, value=(b == default["backend"]))
             yield Label(
                 "model (type to filter, pick below, or blank = default)", classes="wizard-label"
             )
             yield Input(
-                value=self._model,
+                value=default["model"],
                 placeholder="e.g. qwen-plus · claude-opus-4-8 · gpt-4.1",
                 id="model-name",
             )
@@ -631,8 +646,12 @@ class ModelScreen(ModalScreen[dict | None]):
         self._fetch_models()
 
     def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
-        # Provider changed → re-list its models (the exclusive worker cancels any in flight).
-        self._fetch_models()
+        if self._suppress:
+            return
+        if event.radio_set.id == "target":
+            self._load_target()  # show that target's current backend/model, then re-list
+        elif event.radio_set.id == "backend":
+            self._fetch_models()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "model-name":
@@ -642,9 +661,28 @@ class ModelScreen(ModalScreen[dict | None]):
         # Picking a model fills the field (which the user can still edit before Use).
         self.query_one("#model-name", Input).value = str(event.option.prompt)
 
+    def _selected_target(self) -> str:
+        idx = self.query_one("#target", RadioSet).pressed_index
+        return _MODEL_TARGETS[idx] if idx >= 0 else "default"
+
     def _selected_backend(self) -> str:
         idx = self.query_one("#backend", RadioSet).pressed_index
-        return _BACKENDS[idx] if idx >= 0 else self._backend
+        return _BACKENDS[idx] if idx >= 0 else self._assignments["default"]["backend"]
+
+    def _load_target(self) -> None:
+        """Reload the backend radio + model field from the newly-selected target's assignment."""
+        target = self._selected_target()
+        a = self._assignments.get(target) or self._assignments["default"]
+        self._suppress = True
+        try:
+            for i, btn in enumerate(self.query_one("#backend", RadioSet).query(RadioButton)):
+                if _BACKENDS[i] == a["backend"]:
+                    btn.value = True  # RadioSet deselects the others
+                    break
+        finally:
+            self._suppress = False
+        self.query_one("#model-name", Input).value = a["model"]
+        self._fetch_models()
 
     @work(exclusive=True)
     async def _fetch_models(self) -> None:
@@ -688,9 +726,10 @@ class ModelScreen(ModalScreen[dict | None]):
         self._submit()
 
     def _submit(self) -> None:
-        backend = self._selected_backend()
         model = self.query_one("#model-name", Input).value.strip() or None
-        self.dismiss({"backend": backend, "model": model})
+        self.dismiss(
+            {"target": self._selected_target(), "backend": self._selected_backend(), "model": model}
+        )
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -934,10 +973,10 @@ class AitomationApp(App):
     HeaderTitle:hover { background: $foreground 10%; }
     #wizard { width: 64; height: auto; padding: 1 2; background: $surface; border: round $primary; }
     #wizard-title { color: $accent; text-style: bold; width: 100%; content-align: center middle; padding-bottom: 1; }
-    #model-picker { width: 60; height: auto; padding: 1 2; background: $surface; border: round $primary; }
+    #model-picker { width: 60; height: auto; max-height: 95%; padding: 1 2; background: $surface; border: round $primary; }
     #model-title { color: $accent; text-style: bold; width: 100%; content-align: center middle; padding-bottom: 1; }
     #model-status { height: 1; color: #7f8ea3; }
-    #model-list { height: 12; margin-top: 1; border: round #243240; background: $surface; }
+    #model-list { height: 8; margin-top: 1; border: round #243240; background: $surface; }
     #model-buttons { height: auto; padding-top: 1; align: center middle; }
     #model-buttons Button { margin: 0 1; }
     #editor-picker { width: 48; height: auto; padding: 1 2; background: $surface; border: round $primary; }
@@ -997,6 +1036,12 @@ class AitomationApp(App):
         self._provider_override = provider_override
         self._model_override = model_override
         self._config: LLMConfig | None = None
+        # Optional per-stage model overrides (discover/write/fix). A stage without an entry uses
+        # the default provider above — so you can draft on a cheap model and self-heal on a
+        # stronger one. Built lazily into providers that share the recorder, so each stage's
+        # usage is logged under its own model.
+        self._stage_cfg: dict[str, LLMConfig] = {}
+        self._stage_llm: dict[str, LLMProvider] = {}
         self._records: list[SystemRecord] = []
         self.current: SystemRecord | None = None
         self.current_inv = None
@@ -1085,19 +1130,51 @@ class AitomationApp(App):
     def _model(self) -> str | None:
         return self._model_override or (self._config.model if self._config else None)
 
+    def _provider_for(self, stage: str) -> LLMProvider | None:
+        """The provider a pipeline stage (discover/write/fix) should use: its own override if
+        one was set, else the default. None only if no default is configured (callers guard)."""
+        return self._stage_llm.get(stage) or self._llm
+
+    def _config_for(self, stage: str) -> LLMConfig | None:
+        """The LLMConfig backing a stage — its override if pinned, else the default."""
+        return self._stage_cfg.get(stage) or self._config
+
+    def _model_for(self, stage: str) -> str | None:
+        """The model name a stage will use (its override, else the default model)."""
+        cfg = self._config_for(stage)
+        return cfg.model if cfg else self._model()
+
     def action_choose_model(self) -> None:
         """Open the provider/model picker (also reachable by clicking the title bar)."""
-        backend = self._config.backend if self._config else (self._provider_override or "anthropic")
-        model = self._config.model if self._config else (self._model_override or "")
-        self.push_screen(ModelScreen(backend, model), self._on_model_chosen)
+        default_backend = (
+            self._config.backend if self._config else (self._provider_override or "anthropic")
+        )
+        default_model = self._config.model if self._config else (self._model_override or "")
+        # The model the picker shows per target: the stage's own override, or the default.
+        assignments: dict[str, dict[str, str]] = {
+            "default": {"backend": default_backend, "model": default_model}
+        }
+        for stage in _MODEL_STAGES:
+            cfg = self._stage_cfg.get(stage)
+            assignments[stage] = (
+                {"backend": cfg.backend, "model": cfg.model}
+                if cfg
+                else {"backend": default_backend, "model": ""}
+            )
+        self.push_screen(ModelScreen(assignments), self._on_model_chosen)
 
     def _on_model_chosen(self, result: dict | None) -> None:
-        if result:
+        if not result:
+            return
+        target = result.get("target", "default")
+        if target == "default":
             self._apply_model_choice(result["backend"], result["model"])
+        else:
+            self._apply_stage_model(target, result["backend"], result["model"])
 
     def _apply_model_choice(self, backend: str | None, model: str | None) -> None:
-        """Re-resolve the provider for the chosen backend/model. BYO-key: a backend with no
-        key configured is rejected here (with a message) instead of failing mid-operation."""
+        """Re-resolve the DEFAULT provider for the chosen backend/model. BYO-key: a backend with
+        no key configured is rejected here (with a message) instead of failing mid-operation."""
         try:
             cfg = LLMConfig.from_env(backend=backend, model=model)
         except ConfigError as e:
@@ -1111,6 +1188,22 @@ class AitomationApp(App):
         self._log(
             f"[#56d39a]model[/] → {cfg.backend}:{cfg.model} [dim](output: {cfg.output_mode})[/]"
         )
+        if self.current is not None:
+            self._render_overview()  # the per-stage models line inherits the new default
+
+    def _apply_stage_model(self, stage: str, backend: str | None, model: str | None) -> None:
+        """Pin a specific provider/model for one stage (discover/write/fix). BYO-key: rejected
+        with a message if that backend has no key, same as the default switch."""
+        try:
+            cfg = LLMConfig.from_env(backend=backend, model=model)
+        except ConfigError as e:
+            self.notify(f"Can't set {stage} model: {e}", severity="error", timeout=8)
+            return
+        self._stage_cfg[stage] = cfg
+        self._stage_llm[stage] = PydanticAIProvider(cfg, self.recorder)
+        self._log(f"[#56d39a]{stage} model[/] → {cfg.backend}:{cfg.model}")
+        if self.current is not None:
+            self._render_overview()
 
     # -- log + status -------------------------------------------------------------------
 
@@ -1292,6 +1385,23 @@ class AitomationApp(App):
             "avg": round(wt / n) if n else 0,
         }
 
+    def _stage_models_line(self) -> Text | None:
+        """A compact per-stage model summary for the Overview: each LLM stage shows its pinned
+        model (starred), or the default model it inherits. None when nothing is configured
+        (e.g. an injected provider with no LLMConfig), so the line is simply omitted."""
+        if self._config is None and not self._stage_cfg:
+            return None
+        default_model = self._config.model if self._config else "—"
+        t = Text()
+        for stage in _MODEL_STAGES:
+            cfg = self._stage_cfg.get(stage)
+            t.append(f"{stage} ", style="#7f8ea3")
+            t.append(cfg.model if cfg else default_model, style="#cde7f0" if cfg else "#7f8ea3")
+            if cfg:
+                t.append("*", style="#22d3ee")
+            t.append("  ")
+        return t
+
     def _render_overview(self) -> None:
         inv, rec = self.current_inv, self.current
         if inv is None or rec is None:
@@ -1309,6 +1419,11 @@ class AitomationApp(App):
         body.append(f"{inv.base_url}\n", style="dim")
         body.append(f"\nsource    {inv.source}\n")
         body.append(f"auth      {auth}\n")
+        models_line = self._stage_models_line()
+        if models_line is not None:
+            body.append("models    ")
+            body.append_text(models_line)
+            body.append("\n")
         # pipeline dots with the next step called out underneath
         body.append("pipeline  ")
         for label, on in [("discover", True), ("scaffold", rec.scaffolded), ("write", rec.drafted)]:
@@ -1605,7 +1720,7 @@ class AitomationApp(App):
     # -- actions ------------------------------------------------------------------------
 
     def action_new_system(self) -> None:
-        self.push_screen(WizardScreen(self._model() or ""), self._on_wizard)
+        self.push_screen(WizardScreen(self._model_for("discover") or ""), self._on_wizard)
 
     def _on_wizard(self, result: dict | None) -> None:
         if not result or not self._provider_ready():
@@ -1617,7 +1732,7 @@ class AitomationApp(App):
             self.notify("Select a system first.", severity="warning")
             return
         if self._provider_ready():
-            self.run_discover(self.current.source, self.current.origin, self._model())
+            self.run_discover(self.current.source, self.current.origin, self._model_for("discover"))
 
     def action_scaffold(self) -> None:
         if self.current is None or self.current_inv is None:
@@ -1794,14 +1909,17 @@ class AitomationApp(App):
 
     @work(exclusive=True, group="op")
     async def run_discover(self, source: str, origin: str, model: str | None) -> None:
-        provider = self._llm
-        if model and self._config and model != self._config.model:
+        # Default to the discover-stage model; a model typed in the wizard is a one-off override
+        # for this discovery only, applied on the discover stage's (or default) backend.
+        provider = self._provider_for("discover")
+        base_cfg = self._config_for("discover")
+        if model and base_cfg and model != base_cfg.model:
             try:
                 provider = PydanticAIProvider(
-                    LLMConfig.from_env(backend=self._config.backend, model=model), self.recorder
+                    LLMConfig.from_env(backend=base_cfg.backend, model=model), self.recorder
                 )
             except ConfigError:
-                provider = self._llm
+                provider = self._provider_for("discover")
         self.recorder.app = origin
         self._begin_progress(None, f"discovering {escape(origin)} …")
         # `source` is a wizard key on a new discover, but re-discover passes the saved
@@ -1934,7 +2052,9 @@ class AitomationApp(App):
 
         try:
             # Non-destructive: only new flows are drafted; existing tests are kept.
-            report = await draft_tests(self.current_inv, self._llm, into=dest, on_draft=progress)
+            report = await draft_tests(
+                self.current_inv, self._provider_for("write"), into=dest, on_draft=progress
+            )
         except Exception as e:
             self._log(f"[#f2647b]write failed[/] {escape(str(e))}")
             self.notify(f"Write failed: {type(e).__name__}: {e}", severity="error", timeout=8)
@@ -1966,7 +2086,9 @@ class AitomationApp(App):
             self._log(f"{verb} {r.path.name}")
 
         try:
-            report = await heal_failing_tests(inv, self._llm, into=dest, on_heal=progress)
+            report = await heal_failing_tests(
+                inv, self._provider_for("fix"), into=dest, on_heal=progress
+            )
         except Exception as e:
             self._log(f"[#f2647b]fix failed[/] {escape(str(e))}")
             self.notify(f"Fix failed: {type(e).__name__}: {e}", severity="error", timeout=8)

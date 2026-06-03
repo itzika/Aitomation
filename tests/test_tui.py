@@ -509,6 +509,41 @@ async def test_model_choice_rejects_backend_without_key(tmp_path, monkeypatch):
         assert app._config is None  # nothing applied
 
 
+async def test_stage_model_override_routes_per_stage(tmp_path, monkeypatch):
+    for var in _LLM_ENV:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    app = _app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._apply_model_choice("anthropic", "claude-opus-4-8")  # the default for every stage
+        # pin a different model just for the fix stage
+        app._apply_stage_model("fix", "openai", "gpt-4.1")
+        await pilot.pause()
+
+        assert app._stage_cfg["fix"].backend == "openai"
+        # fix routes to its own provider; write/discover fall back to the default
+        assert app._provider_for("fix") is app._stage_llm["fix"]
+        assert app._provider_for("write") is app._llm
+        assert app._provider_for("discover") is app._llm
+        assert app._provider_for("fix") is not app._provider_for("write")
+
+
+async def test_stage_model_override_rejected_without_key(tmp_path, monkeypatch):
+    for var in _LLM_ENV:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    app = _app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._apply_model_choice("anthropic", "claude-opus-4-8")
+        app._apply_stage_model("write", "dashscope", "qwen-plus")  # no DASHSCOPE_API_KEY
+        await pilot.pause()
+        assert "write" not in app._stage_cfg  # rejected, nothing pinned
+        assert app._provider_for("write") is app._llm  # still the default
+
+
 def test_find_app_bundle_prefers_exact_then_prefix(tmp_path):
     from aitomation.tui.app import _find_app_bundle
 
