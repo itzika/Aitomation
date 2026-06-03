@@ -39,6 +39,7 @@ from textual.widgets import (
     Footer,
     Input,
     Label,
+    OptionList,
     ProgressBar,
     RadioButton,
     RadioSet,
@@ -47,6 +48,7 @@ from textual.widgets import (
     TabbedContent,
     TabPane,
 )
+from textual.widgets.option_list import Option
 
 from ..config import Backend, ConfigError, LLMConfig
 from ..diff import diff_inventories
@@ -56,7 +58,7 @@ from ..discover.database import discover_db
 from ..discover.openapi import discover_openapi
 from ..discover.registry import discover_registry
 from ..naming import PROJECTS_ROOT
-from ..providers import LLMProvider, PydanticAIProvider
+from ..providers import LLMProvider, PydanticAIProvider, list_models
 from ..scaffold import scaffold_project
 from ..scaffold.generator import _func_name
 from ..telemetry import DEFAULT_LOG, UsageRecorder, aggregate, load_records
@@ -588,7 +590,12 @@ class UsageMeters(Static):
 class ModelScreen(ModalScreen[dict | None]):
     """Pick the provider + model the toolkit talks to. The header shows the active one;
     clicking it (or pressing m) opens this. Switching is BYO-key: a backend with no key
-    configured is rejected with a message rather than silently failing later."""
+    configured is rejected with a message rather than silently failing later.
+
+    The provider's available models are pulled live from its `/models` endpoint and shown as a
+    type-to-filter list, so you can pick (e.g.) one of Qwen's 100+ models without knowing the
+    exact id. The text field still accepts a free-typed name (or blank for the default), so it
+    keeps working offline or for a model the listing doesn't return."""
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
@@ -596,6 +603,7 @@ class ModelScreen(ModalScreen[dict | None]):
         super().__init__()
         self._backend = current_backend
         self._model = current_model
+        self._models: list[str] = []  # last fetched, unfiltered
 
     def compose(self) -> ComposeResult:
         with Vertical(id="model-picker"):
@@ -604,18 +612,71 @@ class ModelScreen(ModalScreen[dict | None]):
             with RadioSet(id="backend"):
                 for b in _BACKENDS:
                     yield RadioButton(b, value=(b == self._backend))
-            yield Label("model (blank = provider default)", classes="wizard-label")
+            yield Label(
+                "model (type to filter, pick below, or blank = default)", classes="wizard-label"
+            )
             yield Input(
                 value=self._model,
                 placeholder="e.g. qwen-plus · claude-opus-4-8 · gpt-4.1",
                 id="model-name",
             )
+            yield Label("", id="model-status")
+            yield OptionList(id="model-list")
             with Horizontal(id="model-buttons"):
                 yield Button("Use", variant="primary", id="use")
                 yield Button("Cancel", id="cancel")
 
     def on_mount(self) -> None:
         self.query_one("#model-name", Input).focus()
+        self._fetch_models()
+
+    def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
+        # Provider changed → re-list its models (the exclusive worker cancels any in flight).
+        self._fetch_models()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "model-name":
+            self._refilter()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        # Picking a model fills the field (which the user can still edit before Use).
+        self.query_one("#model-name", Input).value = str(event.option.prompt)
+
+    def _selected_backend(self) -> str:
+        idx = self.query_one("#backend", RadioSet).pressed_index
+        return _BACKENDS[idx] if idx >= 0 else self._backend
+
+    @work(exclusive=True)
+    async def _fetch_models(self) -> None:
+        status = self.query_one("#model-status", Label)
+        self.query_one("#model-list", OptionList).clear_options()
+        self._models = []
+        backend = self._selected_backend()
+        try:
+            cfg = LLMConfig.from_env(backend=backend)
+        except ConfigError:
+            status.update("[#e0b341]no key/base_url for this provider — type a model name[/]")
+            return
+        status.update(f"[dim]listing {backend} models…[/]")
+        try:
+            models = await asyncio.to_thread(list_models, cfg)
+        except Exception as e:
+            status.update(f"[#e0b341]couldn't list models ({type(e).__name__}) — type a name[/]")
+            return
+        self._models = models
+        status.update(
+            f"[dim]{len(models)} models — type to filter[/]"
+            if models
+            else "[#e0b341]provider returned no models — type a name[/]"
+        )
+        self._refilter()
+
+    def _refilter(self) -> None:
+        q = self.query_one("#model-name", Input).value.strip().lower()
+        shown = [m for m in self._models if q in m.lower()] if q else self._models
+        ol = self.query_one("#model-list", OptionList)
+        ol.clear_options()
+        ol.add_options([Option(m) for m in shown[:300]])
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "cancel":
@@ -627,8 +688,7 @@ class ModelScreen(ModalScreen[dict | None]):
         self._submit()
 
     def _submit(self) -> None:
-        idx = self.query_one("#backend", RadioSet).pressed_index
-        backend = _BACKENDS[idx] if idx >= 0 else None
+        backend = self._selected_backend()
         model = self.query_one("#model-name", Input).value.strip() or None
         self.dismiss({"backend": backend, "model": model})
 
@@ -876,6 +936,8 @@ class AitomationApp(App):
     #wizard-title { color: $accent; text-style: bold; width: 100%; content-align: center middle; padding-bottom: 1; }
     #model-picker { width: 60; height: auto; padding: 1 2; background: $surface; border: round $primary; }
     #model-title { color: $accent; text-style: bold; width: 100%; content-align: center middle; padding-bottom: 1; }
+    #model-status { height: 1; color: #7f8ea3; }
+    #model-list { height: 12; margin-top: 1; border: round #243240; background: $surface; }
     #model-buttons { height: auto; padding-top: 1; align: center middle; }
     #model-buttons Button { margin: 0 1; }
     #editor-picker { width: 48; height: auto; padding: 1 2; background: $surface; border: round $primary; }
@@ -1441,7 +1503,9 @@ class AitomationApp(App):
                     "output": out_t,
                     "total": in_t + out_t,
                     "cost": sum(_cost_of(x) for x in rs),
-                    "rows": aggregate(rs, ("label",)),
+                    # group per (label, model) so a stage run on a different model than another
+                    # (e.g. write on Qwen, fix on Claude) shows as its own row with its model.
+                    "rows": aggregate(rs, ("label", "model")),
                 }
             )
         model_tok: dict[str, int] = {}
@@ -1488,14 +1552,20 @@ class AitomationApp(App):
 
     @staticmethod
     def _run_table(run: dict) -> RichTable:
-        """Per-prompt breakdown shown inside an expanded run, stage-coloured by label."""
+        """Per-prompt breakdown shown inside an expanded run, stage-coloured by label. The model
+        column makes per-stage provider choices visible (e.g. write on Qwen, fix on Claude)."""
         table = RichTable(expand=True, show_edge=False, pad_edge=False)
         table.add_column("prompt", justify="left", overflow="ellipsis", no_wrap=True)
+        table.add_column(
+            "model", justify="left", overflow="ellipsis", no_wrap=True, style="#7f8ea3"
+        )
         for col in ("calls", "in", "out", "total", "sec"):
             table.add_column(col, justify="right", style="#9fb0c0")
         for g in run["rows"]:
+            model = str(g.get("model") or "—")
             table.add_row(
                 Text(g["label"], style=_STAGE_STYLE.get(_stage_of(g["label"]), "")),
+                model if len(model) <= 22 else model[:21] + "…",
                 str(g["calls"]),
                 f"{g['input_tokens']:,}",
                 f"{g['output_tokens']:,}",

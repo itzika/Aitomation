@@ -425,7 +425,9 @@ async def test_enable_action_cancel_keeps_skip(tmp_path):
         assert "mark.skip" in skipped.read_text()
 
 
-async def test_model_picker_opens_and_closes(tmp_path):
+async def test_model_picker_opens_and_closes(tmp_path, monkeypatch):
+    for var in _LLM_ENV:  # no key → the on-open model fetch short-circuits (no network)
+        monkeypatch.delenv(var, raising=False)
     _seed(tmp_path)
     app = _app(tmp_path)
     async with app.run_test() as pilot:
@@ -438,9 +440,11 @@ async def test_model_picker_opens_and_closes(tmp_path):
         assert not isinstance(app.screen, ModelScreen)
 
 
-async def test_clicking_title_bar_opens_model_picker(tmp_path):
+async def test_clicking_title_bar_opens_model_picker(tmp_path, monkeypatch):
     from aitomation.tui.app import MatrixBanner
 
+    for var in _LLM_ENV:
+        monkeypatch.delenv(var, raising=False)
     _seed(tmp_path)
     app = _app(tmp_path)
     async with app.run_test() as pilot:
@@ -448,6 +452,34 @@ async def test_clicking_title_bar_opens_model_picker(tmp_path):
         await pilot.click(MatrixBanner)  # centre of the band == the title row -> model picker
         await pilot.pause()
         assert isinstance(app.screen, ModelScreen)
+
+
+async def test_model_picker_lists_and_filters_models(tmp_path, monkeypatch):
+    from textual.widgets import Input, OptionList
+
+    for var in _LLM_ENV:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")  # so the listing has credentials
+    # stub the network: the picker fetches the provider's models via providers.list_models
+    monkeypatch.setattr(
+        "aitomation.tui.app.list_models",
+        lambda cfg, **k: ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"],
+    )
+    _seed(tmp_path)
+    app = _app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("m")
+        await pilot.pause()
+        await pilot.pause()  # let the fetch worker resolve and populate the list
+        screen = app.screen
+        assert isinstance(screen, ModelScreen)
+        ol = screen.query_one("#model-list", OptionList)
+        assert ol.option_count == 3
+        # typing filters the list to matches
+        screen.query_one("#model-name", Input).value = "sonnet"
+        await pilot.pause()
+        assert ol.option_count == 1
 
 
 async def test_model_choice_applies(tmp_path, monkeypatch):
@@ -840,6 +872,29 @@ def test_usage_data_groups_runs_models_and_stages():
     assert d["stages"] == [("discover", 1200), ("write", 2500), ("fix", 600)]
     # cost only counts priced models (opus run); qwen is priced too here so cost > 0
     assert d["cost"] > 0 and d["unpriced"] == 0
+
+
+def test_usage_run_rows_show_per_stage_model():
+    import io
+
+    from rich.console import Console
+
+    from aitomation.tui.app import AitomationApp
+
+    # one session run: write on Qwen, fix on Claude — the per-row breakdown must name each model
+    recs = [
+        _usage_record("Demo API", "runB", "write:test_x", "dashscope", "qwen-plus", 2000, 500),
+        _usage_record("Demo API", "runB", "fix:test_x", "anthropic", "claude-sonnet-4-6", 500, 100),
+    ]
+    run = AitomationApp._usage_data(recs)["runs"][0]
+    by_label = {r["label"]: r["model"] for r in run["rows"]}
+    assert by_label["write:test_x"] == "qwen-plus"
+    assert by_label["fix:test_x"] == "claude-sonnet-4-6"
+
+    buf = io.StringIO()
+    Console(file=buf, width=160).print(AitomationApp._run_table(run))
+    text = buf.getvalue()
+    assert "qwen-plus" in text and "claude-sonnet-4-6" in text
 
 
 async def test_usage_tab_empty_without_records(tmp_path):

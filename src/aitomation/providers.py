@@ -98,6 +98,35 @@ def _result_usage(result: object) -> object | None:
     return u
 
 
+def list_models(config: LLMConfig, *, timeout: float = 15.0) -> list[str]:
+    """The model IDs the configured provider currently offers, fetched from its `/models`
+    endpoint. Model-agnostic: OpenAI / openai-compatible / DashScope share the OpenAI listing
+    shape; Anthropic uses its own auth headers. This lets a picker show real choices (e.g.
+    Qwen's 100+ models) instead of requiring an exact name typed by hand. BYO-key: needs the
+    same credentials as inference. Raises on transport/HTTP errors so the caller can surface
+    why (no key, bad base_url, offline)."""
+    import httpx
+
+    if config.backend == "anthropic":
+        base = (config.base_url or "https://api.anthropic.com").rstrip("/")
+        url = f"{base}/models" if base.endswith("/v1") else f"{base}/v1/models"
+        headers = {"x-api-key": config.api_key or "", "anthropic-version": "2023-06-01"}
+    else:
+        # openai / openai-compatible / dashscope all expose GET {base}/models.
+        base = (config.base_url or "https://api.openai.com/v1").rstrip("/")
+        url = f"{base}/models"
+        headers = {"Authorization": f"Bearer {config.api_key}"} if config.api_key else {}
+
+    resp = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
+    resp.raise_for_status()
+    data = resp.json()
+    items = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+    ids = [str(m["id"]) for m in items if isinstance(m, dict) and m.get("id")]
+    return sorted(set(ids))
+
+
 def _build_model(cfg: LLMConfig) -> Model:
     """Construct the concrete Pydantic AI model for the configured backend."""
     if cfg.backend == "anthropic":
