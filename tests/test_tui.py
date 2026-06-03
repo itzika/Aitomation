@@ -724,6 +724,29 @@ def test_usage_price_and_cost_helpers():
     assert _stage_of("something-else") == "other"
 
 
+def test_cost_includes_cached_tokens():
+    from aitomation.tui.app import _cost_of
+
+    # opus input rate = $15/M. Cached input is billed apart: read ~0.1x, write ~1.25x.
+    rec = {
+        "provider": "anthropic",
+        "model": "claude-opus-4-8",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 1_000_000,  # 1M * 15 * 0.1  = 1.5
+        "cache_write_tokens": 1_000_000,  # 1M * 15 * 1.25 = 18.75
+    }
+    assert _cost_of(rec) == 1.5 + 18.75
+    # records without cache fields are unaffected (back-compat with pre-cache logs)
+    no_cache = {
+        "provider": "anthropic",
+        "model": "claude-opus-4-8",
+        "input_tokens": 1_000_000,
+        "output_tokens": 0,
+    }
+    assert _cost_of(no_cache) == 15.0
+
+
 def test_usage_bar_and_sparkline_helpers():
     from aitomation.tui.app import _ascii_bar, _bar, _sparkline
 

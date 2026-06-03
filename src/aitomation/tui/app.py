@@ -60,8 +60,8 @@ from ..providers import LLMProvider, PydanticAIProvider
 from ..scaffold import scaffold_project
 from ..scaffold.generator import _func_name
 from ..telemetry import DEFAULT_LOG, UsageRecorder, aggregate, load_records
+from ..workspace import SystemRecord, Workspace, slugify
 from ..write import draft_tests, enable_drafts, heal_failing_tests, select_journeys
-from .workspace import SystemRecord, Workspace, slugify
 
 # Restrained dark: ONE cyan accent on cool neutral darks. The old neon triad (cyan + magenta +
 # green) is gone — magenta retired to a muted slate, the accent unified to cyan, and the loud
@@ -200,13 +200,18 @@ def _price_for(provider: str, model: str) -> tuple[float, float] | None:
 
 
 def _cost_of(r: dict) -> float:
-    """Estimated USD for one call record (0 if its model isn't in the price table)."""
+    """Estimated USD for one call record (0 if its model isn't in the price table). Cached
+    input is billed apart from fresh input — read at ~0.1x and write at ~1.25x of the input
+    rate (Anthropic prompt-caching); providers without cache fields contribute 0 for them."""
     price = _price_for(r.get("provider", ""), r.get("model", ""))
     if not price:
         return 0.0
+    in_rate, out_rate = price
     return (
-        int(r.get("input_tokens", 0)) / 1e6 * price[0]
-        + int(r.get("output_tokens", 0)) / 1e6 * price[1]
+        int(r.get("input_tokens", 0)) / 1e6 * in_rate
+        + int(r.get("output_tokens", 0)) / 1e6 * out_rate
+        + int(r.get("cache_read_tokens", 0)) / 1e6 * in_rate * 0.1
+        + int(r.get("cache_write_tokens", 0)) / 1e6 * in_rate * 1.25
     )
 
 
@@ -920,7 +925,9 @@ class AitomationApp(App):
     ) -> None:
         super().__init__()
         # Default workspace lives under projects/ so generated systems don't litter the repo
-        # root. Each system gets projects/<slug>/ (see Workspace), shared with the CLI.
+        # root. Shared with the CLI: both resolve a system's scaffold + drafts to the same
+        # projects/<slug>/e2e/run-*/ run dir via this Workspace, so artifacts produced by
+        # either front-end are listed/usable by the other.
         self.workspace = Workspace(workspace_root if workspace_root is not None else PROJECTS_ROOT)
         self.recorder = UsageRecorder(app="tui-session", log_path=usage_log)
         self._injected_llm = llm

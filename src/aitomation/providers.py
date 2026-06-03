@@ -82,6 +82,22 @@ def _build_settings(cfg: LLMConfig) -> ModelSettings:
     return ModelSettings(**base)
 
 
+def _result_usage(result: object) -> object | None:
+    """The usage object off an agent run, tolerating Pydantic AI's API shape across versions.
+
+    `AgentRunResult.usage` is currently a property-like accessor returning a `RunUsage`; older
+    releases exposed it as a `.usage()` method. Read the attribute, and if it came back as a
+    bare callable without token fields, call it — so a future revert to the method form can't
+    silently make telemetry record zeros."""
+    u = getattr(result, "usage", None)
+    if u is not None and not hasattr(u, "input_tokens") and callable(u):
+        try:
+            u = u()
+        except Exception:
+            return None
+    return u
+
+
 def _build_model(cfg: LLMConfig) -> Model:
     """Construct the concrete Pydantic AI model for the configured backend."""
     if cfg.backend == "anthropic":
@@ -138,7 +154,7 @@ class PydanticAIProvider:
                 model=self.config.model,
                 system=system,
                 user=prompt,
-                usage=getattr(result, "usage", None),
+                usage=_result_usage(result),
                 duration_s=time.perf_counter() - t0,
                 started_at=started_at,
                 ended_at=_now(),

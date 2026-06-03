@@ -41,6 +41,7 @@ class CallRecord:
     output_tokens: int
     total_tokens: int
     cache_read_tokens: int
+    cache_write_tokens: int
     requests: int
     duration_s: float
     started_at: str
@@ -103,6 +104,7 @@ class UsageRecorder:
             output_tokens=output_tokens,
             total_tokens=input_tokens + output_tokens,
             cache_read_tokens=int(getattr(usage, "cache_read_tokens", 0) or 0),
+            cache_write_tokens=int(getattr(usage, "cache_write_tokens", 0) or 0),
             requests=int(getattr(usage, "requests", 0) or 0),
             duration_s=round(duration_s, 3),
             started_at=started_at,

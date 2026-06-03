@@ -14,12 +14,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-# Web/API surface: page/form/flow/endpoint/auth. Backend surface added later:
-# topic/event_schema (message queues), table/migration (databases).
+# Web/API surface: page/form/endpoint/auth. Backend surface: topic/event_schema (message
+# queues), table/migration (databases). `migration` is reserved for DDL-migration elements the
+# scaffold/write layers already group with `table`; the DB path emits `table` today.
 ElementKind = Literal[
     "page",
     "form",
-    "flow",
     "endpoint",
     "auth",
     "topic",
@@ -32,7 +32,7 @@ Priority = Literal["high", "medium", "low"]
 InputWhere = Literal[
     "query", "path", "header", "cookie", "body", "form", "column", "message", "unknown"
 ]
-DiscoverySource = Literal["openapi", "crawl", "postman", "asyncapi", "schema_registry", "db_schema"]
+DiscoverySource = Literal["openapi", "crawl", "asyncapi", "schema_registry", "db_schema"]
 
 
 class InputField(BaseModel):
