@@ -34,7 +34,11 @@ def test_new_element_kinds_and_where_accepted():
 
 
 def test_event_schema_carries_json_schema():
-    schema = {"type": "object", "required": ["orderId"], "properties": {"orderId": {"type": "string"}}}
+    schema = {
+        "type": "object",
+        "required": ["orderId"],
+        "properties": {"orderId": {"type": "string"}},
+    }
     el = models.TestableElement(
         kind="event_schema",
         name="OrderCreated",
@@ -53,19 +57,31 @@ def test_event_schema_carries_json_schema():
 
 def test_json_schema_defaults_none_for_other_kinds():
     el = models.TestableElement(
-        kind="endpoint", name="getPet", location="/pets/{id}", method="GET",
-        description="Read a pet.", priority="medium",
+        kind="endpoint",
+        name="getPet",
+        location="/pets/{id}",
+        method="GET",
+        description="Read a pet.",
+        priority="medium",
     )
     assert el.json_schema is None
 
 
 def test_counts_by_kind_includes_backend_kinds():
     inv = CoverageInventory(
-        system_name="Mixed", base_url="x", source="db_schema",
+        system_name="Mixed",
+        base_url="x",
+        source="db_schema",
         elements=[
-            models.TestableElement(kind="table", name="t1", location="t1", description="", priority="low"),
-            models.TestableElement(kind="table", name="t2", location="t2", description="", priority="low"),
-            models.TestableElement(kind="topic", name="evt", location="evt", description="", priority="high"),
+            models.TestableElement(
+                kind="table", name="t1", location="t1", description="", priority="low"
+            ),
+            models.TestableElement(
+                kind="table", name="t2", location="t2", description="", priority="low"
+            ),
+            models.TestableElement(
+                kind="topic", name="evt", location="evt", description="", priority="high"
+            ),
         ],
     )
     assert inv.counts_by_kind() == {"table": 2, "topic": 1}

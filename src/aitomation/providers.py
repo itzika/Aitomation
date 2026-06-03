@@ -34,10 +34,17 @@ class LLMProvider(Protocol):
     `label` names the operation/prompt for usage instrumentation (e.g. 'discover.openapi',
     'write:test_pet_lifecycle')."""
 
-    async def generate(self, prompt: str, *, system: str | None = None, label: str = "generate") -> str: ...
+    async def generate(
+        self, prompt: str, *, system: str | None = None, label: str = "generate"
+    ) -> str: ...
 
     async def generate_structured(
-        self, prompt: str, schema: type[T], *, system: str | None = None, label: str = "generate_structured"
+        self,
+        prompt: str,
+        schema: type[T],
+        *,
+        system: str | None = None,
+        label: str = "generate_structured",
     ) -> T: ...
 
 
@@ -63,7 +70,7 @@ def _build_settings(cfg: LLMConfig) -> ModelSettings:
     system prompt + a fixed Pydantic schema), so caching them bills the prefix at ~0.1x after
     the first call. OpenAI/DashScope and local servers do prefix caching implicitly server-
     side, so they need no equivalent flag here."""
-    base = dict(temperature=cfg.temperature, max_tokens=cfg.max_tokens)
+    base = {"temperature": cfg.temperature, "max_tokens": cfg.max_tokens}
     if cfg.backend == "anthropic":
         from pydantic_ai.models.anthropic import AnthropicModelSettings
 
@@ -105,7 +112,9 @@ class PydanticAIProvider:
         self._settings = _build_settings(config)
 
     @classmethod
-    def from_env(cls, *, backend: str | None = None, model: str | None = None) -> "PydanticAIProvider":
+    def from_env(
+        cls, *, backend: str | None = None, model: str | None = None
+    ) -> PydanticAIProvider:
         return cls(LLMConfig.from_env(backend=backend, model=model))
 
     async def _run(self, agent: Agent, prompt: str, system: str | None, label: str):
@@ -119,7 +128,7 @@ class PydanticAIProvider:
         try:
             result = await agent.run(prompt)
             return result
-        except Exception as e:  # noqa: BLE001 — record the failed call, then re-raise
+        except Exception as e:
             ok, error = False, f"{type(e).__name__}: {e}"
             raise
         finally:
@@ -137,7 +146,9 @@ class PydanticAIProvider:
                 error=error,
             )
 
-    async def generate(self, prompt: str, *, system: str | None = None, label: str = "generate") -> str:
+    async def generate(
+        self, prompt: str, *, system: str | None = None, label: str = "generate"
+    ) -> str:
         agent: Agent[None, str] = Agent(
             self._model,
             system_prompt=system or (),
@@ -147,7 +158,12 @@ class PydanticAIProvider:
         return result.output
 
     async def generate_structured(
-        self, prompt: str, schema: type[T], *, system: str | None = None, label: str = "generate_structured"
+        self,
+        prompt: str,
+        schema: type[T],
+        *,
+        system: str | None = None,
+        label: str = "generate_structured",
     ) -> T:
         agent: Agent[None, T] = Agent(
             self._model,

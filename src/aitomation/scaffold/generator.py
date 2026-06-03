@@ -11,9 +11,12 @@ from __future__ import annotations
 import re
 from importlib.resources import as_file, files
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..models import CoverageInventory
+
+if TYPE_CHECKING:
+    from ..models import AuthScheme
 
 # auth_strategy values that map to a bearer-token style header.
 _BEARER_LIKE = {"bearer", "oauth2", "oauth", "apikey", "api_key", "token", "jwt"}
@@ -56,7 +59,7 @@ def _normalize_auth(auth_strategy: str | None) -> str:
 
 # Pick a primary scheme deterministically when a spec declares several: prefer the ones a
 # single env token serves cleanly (apiKey-in-header, then bearer), then basic, then the rest.
-def _scheme_rank(s: "AuthScheme") -> int:  # type: ignore[name-defined]
+def _scheme_rank(s: AuthScheme) -> int:
     t = (s.type or "").lower()
     loc = (s.location or "").lower()
     if t == "apikey" and loc in ("", "header"):
@@ -70,7 +73,7 @@ def _scheme_rank(s: "AuthScheme") -> int:  # type: ignore[name-defined]
     return 4
 
 
-def _auth_context(inv: "CoverageInventory") -> dict[str, Any]:  # type: ignore[name-defined]
+def _auth_context(inv: CoverageInventory) -> dict[str, Any]:  # type: ignore[name-defined]
     """Resolve the auth fixture shape from structured schemes (preferred) or the free-text
     strategy (fallback). Returns auth_kind + the header/param details the template needs."""
     schemes = list(getattr(inv, "auth_schemes", []) or [])

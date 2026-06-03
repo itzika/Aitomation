@@ -9,7 +9,7 @@ double as the schema the model is steered by.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -17,17 +17,22 @@ from pydantic import BaseModel, Field
 # Web/API surface: page/form/flow/endpoint/auth. Backend surface added later:
 # topic/event_schema (message queues), table/migration (databases).
 ElementKind = Literal[
-    "page", "form", "flow", "endpoint", "auth",
-    "topic", "event_schema", "table", "migration",
+    "page",
+    "form",
+    "flow",
+    "endpoint",
+    "auth",
+    "topic",
+    "event_schema",
+    "table",
+    "migration",
 ]
 Priority = Literal["high", "medium", "low"]
 # `column` = a database column; `message` = a field of an event/message payload.
 InputWhere = Literal[
     "query", "path", "header", "cookie", "body", "form", "column", "message", "unknown"
 ]
-DiscoverySource = Literal[
-    "openapi", "crawl", "postman", "asyncapi", "schema_registry", "db_schema"
-]
+DiscoverySource = Literal["openapi", "crawl", "postman", "asyncapi", "schema_registry", "db_schema"]
 
 
 class InputField(BaseModel):
@@ -113,7 +118,8 @@ class AuthScheme(BaseModel):
     type: str = Field(description="Scheme type: apiKey/http/oauth2/openIdConnect, or 'session'.")
     scheme: str | None = Field(default=None, description="For http: 'bearer' or 'basic'.")
     name: str | None = Field(
-        default=None, description="For apiKey: the header/query/cookie parameter name (e.g. 'api_key')."
+        default=None,
+        description="For apiKey: the header/query/cookie parameter name (e.g. 'api_key').",
     )
     location: str | None = Field(
         default=None, description="For apiKey: where the key goes — header/query/cookie."
@@ -146,7 +152,7 @@ class CoverageInventory(BaseModel):
         default_factory=list, description="High-value end-to-end paths worth covering."
     )
     generated_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
+        default_factory=lambda: datetime.now(UTC),
         description="When this inventory was generated.",
     )
 

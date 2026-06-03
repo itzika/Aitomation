@@ -105,9 +105,7 @@ def test_message_reused_across_channels_recorded_once():
     spec = {
         "asyncapi": "2.6.0",
         "info": {"title": "X", "version": "1"},
-        "components": {
-            "messages": {"Ping": {"name": "Ping", "payload": {"type": "object"}}}
-        },
+        "components": {"messages": {"Ping": {"name": "Ping", "payload": {"type": "object"}}}},
         "channels": {
             "a": {"publish": {"message": {"$ref": "#/components/messages/Ping"}}},
             "b": {"subscribe": {"message": {"$ref": "#/components/messages/Ping"}}},
@@ -128,7 +126,9 @@ class _FakeJudge:
     async def generate(self, prompt, *, system=None, label=""):  # pragma: no cover
         return ""
 
-    async def generate_structured(self, prompt, schema: type[T], *, system=None, label: str = "") -> T:
+    async def generate_structured(
+        self, prompt, schema: type[T], *, system=None, label: str = ""
+    ) -> T:
         self.last_prompt = prompt
         self.last_system = system
         return schema(
@@ -137,8 +137,13 @@ class _FakeJudge:
             high_priority=["OrderCreated"],
             low_priority=["ghost"],
             suggested_journeys=[
-                {"name": "OrderCreated conforms", "description": "validate payload",
-                 "priority": "high", "steps": [], "elements": ["OrderCreated", "ghost"]},
+                {
+                    "name": "OrderCreated conforms",
+                    "description": "validate payload",
+                    "priority": "high",
+                    "steps": [],
+                    "elements": ["OrderCreated", "ghost"],
+                },
             ],
         )
 

@@ -319,7 +319,9 @@ def _request_body_fields(spec: dict[str, Any], op: dict[str, Any]) -> list[dict[
     for pname, pschema in list(props.items())[:MAX_BODY_PROPS]:
         ptype = pschema.get("type", "object") if isinstance(pschema, dict) else "object"
         example = pschema.get("example") if isinstance(pschema, dict) else None
-        fields.append({"name": pname, "type": ptype, "required": pname in required, "example": example})
+        fields.append(
+            {"name": pname, "type": ptype, "required": pname in required, "example": example}
+        )
     return fields
 
 
@@ -456,7 +458,9 @@ class InventoryJudgment(BaseModel):
     echoing every element name back just to label it 'medium' (a large, pure-waste output
     saving on big specs); it also keeps the schema flat (two string lists, no nested objects)."""
 
-    system_summary: str = Field(description="A few sentences on the system and its testable surface.")
+    system_summary: str = Field(
+        description="A few sentences on the system and its testable surface."
+    )
     auth_strategy: str | None = Field(
         default=None,
         description="Primary auth mechanism inferred from the schemes (oauth2/bearer/apiKey/basic), or null.",
@@ -517,10 +521,7 @@ def render_elements_for_prompt(elements: list[TestableElement]) -> str:
 
 
 def build_judgment_prompt(summary: SpecSummary, elements: list[TestableElement]) -> str:
-    schemes = (
-        "; ".join(f"{k}={v}" for k, v in summary.security_schemes.items())
-        or "none declared"
-    )
+    schemes = "; ".join(f"{k}={v}" for k, v in summary.security_schemes.items()) or "none declared"
     return (
         f"API: {summary.title} (version {summary.version or 'n/a'})\n"
         f"Base URL: {summary.base_url}\n"

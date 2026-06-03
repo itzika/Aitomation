@@ -52,7 +52,9 @@ def test_summarize_enumerates_all_operations(summary):
 
 
 def test_path_level_params_are_inherited(summary):
-    get_by_id = next(o for o in summary.operations if o.method == "GET" and o.path == "/pets/{petId}")
+    get_by_id = next(
+        o for o in summary.operations if o.method == "GET" and o.path == "/pets/{petId}"
+    )
     names = {p["name"] for p in get_by_id.params}
     assert "petId" in names
     pet_id = next(p for p in get_by_id.params if p["name"] == "petId")
@@ -116,10 +118,14 @@ class _FakeJudge:
         self.last_prompt: str | None = None
         self.last_system: str | None = None
 
-    async def generate(self, prompt: str, *, system: str | None = None, label: str = "") -> str:  # pragma: no cover
+    async def generate(
+        self, prompt: str, *, system: str | None = None, label: str = ""
+    ) -> str:  # pragma: no cover
         return ""
 
-    async def generate_structured(self, prompt, schema: type[T], *, system=None, label: str = "") -> T:
+    async def generate_structured(
+        self, prompt, schema: type[T], *, system=None, label: str = ""
+    ) -> T:
         self.last_prompt = prompt
         self.last_system = system
         return schema(
@@ -129,8 +135,13 @@ class _FakeJudge:
             high_priority=["createPet"],
             low_priority=["ghost"],
             suggested_journeys=[
-                {"name": "Make a pet", "description": "create then read", "priority": "high",
-                 "steps": [], "elements": ["createPet", "getPet", "ghost"]},
+                {
+                    "name": "Make a pet",
+                    "description": "create then read",
+                    "priority": "high",
+                    "steps": [],
+                    "elements": ["createPet", "getPet", "ghost"],
+                },
             ],
         )
 
@@ -211,7 +222,12 @@ def test_inputs_capture_examples_from_spec():
                 "get": {
                     "operationId": "listThings",
                     "parameters": [
-                        {"name": "q", "in": "query", "schema": {"type": "string"}, "example": "hello"}
+                        {
+                            "name": "q",
+                            "in": "query",
+                            "schema": {"type": "string"},
+                            "example": "hello",
+                        }
                     ],
                 },
                 "post": {

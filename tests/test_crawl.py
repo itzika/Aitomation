@@ -8,7 +8,6 @@ Chromium isn't installed so the suite stays runnable everywhere.
 from __future__ import annotations
 
 import threading
-from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -59,24 +58,45 @@ def test_normalize_links_resolves_filters_and_dedupes():
 
 def test_field_locator_priority():
     # test-id (data-qa/testid) wins — most stable + unique
-    assert _field_locator({"testId": "name", "testAttr": "data-qa"})[0] == 'locator(\'[data-qa="name"]\')'
+    assert (
+        _field_locator({"testId": "name", "testAttr": "data-qa"})[0]
+        == "locator('[data-qa=\"name\"]')"
+    )
     # then a real <label>, then placeholder, then aria-label, then the name attribute
     assert _field_locator({"labelText": "Your Name"})[0] == 'get_by_label("Your Name")'
-    assert _field_locator({"placeholder": "Email Address"})[0] == 'get_by_placeholder("Email Address")'
+    assert (
+        _field_locator({"placeholder": "Email Address"})[0] == 'get_by_placeholder("Email Address")'
+    )
     assert _field_locator({"ariaLabel": "Search"})[0] == 'get_by_label("Search")'
-    assert _field_locator({"name": "email"})[0] == 'locator(\'[name="email"]\')'
+    assert _field_locator({"name": "email"})[0] == "locator('[name=\"email\"]')"
 
 
 def test_elements_from_crawl_grounds_locators_and_uniqueness():
     # two forms each with an "Email Address" placeholder field → ambiguous (unique=False)
     def email(unique):
-        return FormField(name="email", type="email", human="Email Address",
-                         locator='get_by_placeholder("Email Address")', unique=unique)
-    login = Form(action="/login", method="post", has_password=True, fields=[
-        email(False),
-        FormField(name="password", type="password", human="password",
-                  locator='locator(\'[name="password"]\')', unique=True),
-    ])
+        return FormField(
+            name="email",
+            type="email",
+            human="Email Address",
+            locator='get_by_placeholder("Email Address")',
+            unique=unique,
+        )
+
+    login = Form(
+        action="/login",
+        method="post",
+        has_password=True,
+        fields=[
+            email(False),
+            FormField(
+                name="password",
+                type="password",
+                human="password",
+                locator="locator('[name=\"password\"]')",
+                unique=True,
+            ),
+        ],
+    )
     news = Form(action="/news", method="post", fields=[email(False)])
     page = PageArtifact(url="https://x/login", title="Login", depth=0, forms=[login, news])
     elements = elements_from_crawl(CrawlResult(base_url="https://x", pages=[page]))
@@ -128,7 +148,7 @@ _PAGES = {
 
 
 class _Handler(BaseHTTPRequestHandler):
-    def do_GET(self):  # noqa: N802
+    def do_GET(self):
         body = _PAGES.get(self.path.split("?")[0])
         if body is None:
             self.send_response(404)
@@ -164,7 +184,7 @@ def chromium_ready():
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
             browser.close()
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         pytest.skip(f"Chromium unavailable: {e}")
 
 

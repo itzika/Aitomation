@@ -7,16 +7,16 @@ from .openapi import discover_openapi, load_spec, summarize_spec
 from .registry import discover_registry, fetch_registry
 
 __all__ = [
-    "discover_openapi",
-    "load_spec",
-    "summarize_spec",
-    "discover_crawl",
     "crawl_site",
     "discover_asyncapi",
-    "summarize_asyncapi",
+    "discover_crawl",
+    "discover_db",
+    "discover_openapi",
     "discover_registry",
     "fetch_registry",
-    "discover_db",
+    "load_spec",
     "parse_ddl",
     "reflect_database",
+    "summarize_asyncapi",
+    "summarize_spec",
 ]

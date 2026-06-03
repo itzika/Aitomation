@@ -14,13 +14,13 @@ from __future__ import annotations
 import json
 import shutil
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from ..models import CoverageInventory
 from ..naming import slugify  # re-exported for callers importing it from here
 
-__all__ = ["Workspace", "SystemRecord", "slugify"]
+__all__ = ["SystemRecord", "Workspace", "slugify"]
 
 
 @dataclass(slots=True)
@@ -85,7 +85,9 @@ class Workspace:
             meta = d / ".aito" / "system.json"
             if meta.is_file():
                 try:
-                    records.append(SystemRecord(**json.loads(meta.read_text(encoding="utf-8"))["meta"]))
+                    records.append(
+                        SystemRecord(**json.loads(meta.read_text(encoding="utf-8"))["meta"])
+                    )
                 except (json.JSONDecodeError, KeyError, TypeError):
                     continue
         records.sort(key=lambda r: r.updated_at, reverse=True)
@@ -114,9 +116,11 @@ class Workspace:
             base_url=inv.base_url,
             n_elements=len(inv.elements),
             n_journeys=len(inv.suggested_journeys),
-            scaffolded=bool(prev["scaffolded"]) if scaffolded is None and prev else bool(scaffolded),
+            scaffolded=bool(prev["scaffolded"])
+            if scaffolded is None and prev
+            else bool(scaffolded),
             drafted=bool(prev["drafted"]) if drafted is None and prev else bool(drafted),
-            updated_at=datetime.now(timezone.utc).isoformat(),
+            updated_at=datetime.now(UTC).isoformat(),
             latest_run=prev.get("latest_run") if prev else None,
         )
         self._meta(slug).parent.mkdir(parents=True, exist_ok=True)
@@ -147,7 +151,7 @@ class Workspace:
         try:
             data = json.loads(meta.read_text(encoding="utf-8"))
             return CoverageInventory.model_validate(data["inventory"])
-        except Exception:  # noqa: BLE001 — a corrupt/old meta just means "no baseline"
+        except Exception:
             return None
 
     def set_flags(
@@ -167,7 +171,7 @@ class Workspace:
             meta["drafted"] = drafted
         if latest_run is not None:
             meta["latest_run"] = latest_run
-        meta["updated_at"] = datetime.now(timezone.utc).isoformat()
+        meta["updated_at"] = datetime.now(UTC).isoformat()
         f.write_text(json.dumps(data, indent=2), encoding="utf-8")
         return SystemRecord(**meta)
 

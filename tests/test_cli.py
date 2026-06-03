@@ -53,9 +53,19 @@ def test_cli_try_load_inventory_reads_baseline(tmp_path):
     p = tmp_path / "inventory.json"
     assert _try_load_inventory(p) is None  # nothing there yet
     inv = CoverageInventory(
-        system_name="Demo", base_url="https://x", source="openapi",
-        elements=[Element(kind="endpoint", name="g", location="/x", method="GET",
-                          description="d", priority="high")],
+        system_name="Demo",
+        base_url="https://x",
+        source="openapi",
+        elements=[
+            Element(
+                kind="endpoint",
+                name="g",
+                location="/x",
+                method="GET",
+                description="d",
+                priority="high",
+            )
+        ],
     )
     p.write_text(inv.model_dump_json(), encoding="utf-8")
     assert _try_load_inventory(p).system_name == "Demo"

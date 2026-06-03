@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Optional
 
 import typer
 from rich.console import Console
@@ -54,10 +53,13 @@ def version() -> None:
 
 @app.command()
 def tui(
-    provider: Optional[str] = typer.Option(None, "--provider", "-p", help=_PROVIDER_HELP),
-    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override model name."),
+    provider: str | None = typer.Option(None, "--provider", "-p", help=_PROVIDER_HELP),
+    model: str | None = typer.Option(None, "--model", "-m", help="Override model name."),
     usage_log: Path = typer.Option(
-        Path(DEFAULT_LOG), "--usage-log", envvar="AITOMATION_USAGE_LOG", help="JSONL usage log path."
+        Path(DEFAULT_LOG),
+        "--usage-log",
+        envvar="AITOMATION_USAGE_LOG",
+        help="JSONL usage log path.",
     ),
 ) -> None:
     """Launch the interactive terminal UI (transcript + command prompt + live system sidebar)."""
@@ -114,13 +116,13 @@ def usage(
 
 
 def _resolve_provider(
-    provider: Optional[str], model: Optional[str], recorder: UsageRecorder | None = None
+    provider: str | None, model: str | None, recorder: UsageRecorder | None = None
 ) -> PydanticAIProvider:
     try:
         cfg = LLMConfig.from_env(backend=provider, model=model)
     except ConfigError as e:
         err.print(f"[bold red]Config error:[/] {e}")
-        raise typer.Exit(code=2)
+        raise typer.Exit(code=2) from None
     console.print(f"[dim]via[/] {cfg.backend}:{cfg.model} [dim](output: {cfg.output_mode})[/]")
     return PydanticAIProvider(cfg, recorder)
 
@@ -146,7 +148,7 @@ def _try_load_inventory(path: Path) -> CoverageInventory | None:
         return None
     try:
         return CoverageInventory.model_validate_json(path.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001 — not a valid prior inventory → no baseline
+    except Exception:
         return None
 
 
@@ -180,10 +182,10 @@ def _finish(coro, out: Path) -> None:
         inventory: CoverageInventory = asyncio.run(coro)
     except (FileNotFoundError, ValueError) as e:
         err.print(f"[bold red]Discovery failed:[/] {e}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
     except Exception as e:  # network / provider / validation errors
         err.print(f"[bold red]Discovery failed:[/] {type(e).__name__}: {e}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
     out.write_text(inventory.model_dump_json(indent=2), encoding="utf-8")
     _print_inventory(inventory)
@@ -200,10 +202,13 @@ def discover_openapi_cmd(
     out: Path = typer.Option(
         Path("inventory.json"), "--out", "-o", help="Where to write the inventory JSON."
     ),
-    provider: Optional[str] = typer.Option(None, "--provider", "-p", help=_PROVIDER_HELP),
-    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override model name."),
+    provider: str | None = typer.Option(None, "--provider", "-p", help=_PROVIDER_HELP),
+    model: str | None = typer.Option(None, "--model", "-m", help="Override model name."),
     usage_log: Path = typer.Option(
-        Path(DEFAULT_LOG), "--usage-log", envvar="AITOMATION_USAGE_LOG", help="JSONL usage log path."
+        Path(DEFAULT_LOG),
+        "--usage-log",
+        envvar="AITOMATION_USAGE_LOG",
+        help="JSONL usage log path.",
     ),
 ) -> None:
     """Discover a CoverageInventory from an OpenAPI/Swagger spec."""
@@ -222,10 +227,13 @@ def discover_asyncapi_cmd(
     out: Path = typer.Option(
         Path("inventory.json"), "--out", "-o", help="Where to write the inventory JSON."
     ),
-    provider: Optional[str] = typer.Option(None, "--provider", "-p", help=_PROVIDER_HELP),
-    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override model name."),
+    provider: str | None = typer.Option(None, "--provider", "-p", help=_PROVIDER_HELP),
+    model: str | None = typer.Option(None, "--model", "-m", help="Override model name."),
     usage_log: Path = typer.Option(
-        Path(DEFAULT_LOG), "--usage-log", envvar="AITOMATION_USAGE_LOG", help="JSONL usage log path."
+        Path(DEFAULT_LOG),
+        "--usage-log",
+        envvar="AITOMATION_USAGE_LOG",
+        help="JSONL usage log path.",
     ),
 ) -> None:
     """Discover a CoverageInventory from an AsyncAPI spec (channels → topics, messages → schemas)."""
@@ -244,10 +252,13 @@ def discover_registry_cmd(
     out: Path = typer.Option(
         Path("inventory.json"), "--out", "-o", help="Where to write the inventory JSON."
     ),
-    provider: Optional[str] = typer.Option(None, "--provider", "-p", help=_PROVIDER_HELP),
-    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override model name."),
+    provider: str | None = typer.Option(None, "--provider", "-p", help=_PROVIDER_HELP),
+    model: str | None = typer.Option(None, "--model", "-m", help="Override model name."),
     usage_log: Path = typer.Option(
-        Path(DEFAULT_LOG), "--usage-log", envvar="AITOMATION_USAGE_LOG", help="JSONL usage log path."
+        Path(DEFAULT_LOG),
+        "--usage-log",
+        envvar="AITOMATION_USAGE_LOG",
+        help="JSONL usage log path.",
     ),
 ) -> None:
     """Discover a CoverageInventory from a live schema registry (subjects → event schemas)."""
@@ -268,10 +279,13 @@ def discover_db_cmd(
     out: Path = typer.Option(
         Path("inventory.json"), "--out", "-o", help="Where to write the inventory JSON."
     ),
-    provider: Optional[str] = typer.Option(None, "--provider", "-p", help=_PROVIDER_HELP),
-    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override model name."),
+    provider: str | None = typer.Option(None, "--provider", "-p", help=_PROVIDER_HELP),
+    model: str | None = typer.Option(None, "--model", "-m", help="Override model name."),
     usage_log: Path = typer.Option(
-        Path(DEFAULT_LOG), "--usage-log", envvar="AITOMATION_USAGE_LOG", help="JSONL usage log path."
+        Path(DEFAULT_LOG),
+        "--usage-log",
+        envvar="AITOMATION_USAGE_LOG",
+        help="JSONL usage log path.",
     ),
 ) -> None:
     """Discover a CoverageInventory from a database (live reflection or a .sql DDL file)."""
@@ -292,14 +306,19 @@ def discover_crawl_cmd(
     ),
     max_pages: int = typer.Option(25, "--max-pages", help="Maximum pages to crawl."),
     max_depth: int = typer.Option(3, "--max-depth", help="Maximum link depth from the start URL."),
-    provider: Optional[str] = typer.Option(None, "--provider", "-p", help=_PROVIDER_HELP),
-    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override model name."),
+    provider: str | None = typer.Option(None, "--provider", "-p", help=_PROVIDER_HELP),
+    model: str | None = typer.Option(None, "--model", "-m", help="Override model name."),
     usage_log: Path = typer.Option(
-        Path(DEFAULT_LOG), "--usage-log", envvar="AITOMATION_USAGE_LOG", help="JSONL usage log path."
+        Path(DEFAULT_LOG),
+        "--usage-log",
+        envvar="AITOMATION_USAGE_LOG",
+        help="JSONL usage log path.",
     ),
 ) -> None:
     """Discover a CoverageInventory by crawling a running web app (a11y tree, not pixels)."""
-    console.print(f"[dim]Crawling[/] [bold]{url}[/] [dim](≤{max_pages} pages, depth {max_depth}) …[/]")
+    console.print(
+        f"[dim]Crawling[/] [bold]{url}[/] [dim](≤{max_pages} pages, depth {max_depth}) …[/]"
+    )
     recorder = UsageRecorder(app=url, log_path=usage_log)
     llm = _resolve_provider(provider, model, recorder)
     try:
@@ -313,30 +332,34 @@ def write(
     inventory_path: Path = typer.Argument(
         ..., exists=True, dir_okay=False, help="Path to a CoverageInventory JSON file."
     ),
-    into: Optional[Path] = typer.Option(
+    into: Path | None = typer.Option(
         None,
         "--into",
         "-i",
-        help="Scaffold directory to write draft tests into. "
-        "Defaults to projects/<system-name>.",
+        help="Scaffold directory to write draft tests into. Defaults to projects/<system-name>.",
     ),
     max_journeys: int = typer.Option(8, "--max", help="Max journeys to draft."),
-    verify: bool = typer.Option(False, "--verify", help="Run drafted tests once and self-heal any failures."),
+    verify: bool = typer.Option(
+        False, "--verify", help="Run drafted tests once and self-heal any failures."
+    ),
     force: bool = typer.Option(
         False, "--force", help="Regenerate every flow; default skips flows already drafted."
     ),
-    provider: Optional[str] = typer.Option(None, "--provider", "-p", help=_PROVIDER_HELP),
-    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override model name."),
+    provider: str | None = typer.Option(None, "--provider", "-p", help=_PROVIDER_HELP),
+    model: str | None = typer.Option(None, "--model", "-m", help="Override model name."),
     usage_log: Path = typer.Option(
-        Path(DEFAULT_LOG), "--usage-log", envvar="AITOMATION_USAGE_LOG", help="JSONL usage log path."
+        Path(DEFAULT_LOG),
+        "--usage-log",
+        envvar="AITOMATION_USAGE_LOG",
+        help="JSONL usage log path.",
     ),
 ) -> None:
     """Draft first-draft pytest+Playwright tests, one per journey, into a scaffold (review-only)."""
     try:
         inv = CoverageInventory.model_validate_json(inventory_path.read_text(encoding="utf-8"))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         err.print(f"[bold red]Invalid inventory:[/] {type(e).__name__}: {e}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
     if into is None:
         into = Path(PROJECTS_ROOT) / slugify(inv.system_name)
@@ -354,9 +377,9 @@ def write(
         report = asyncio.run(
             draft_tests(inv, llm, into=into, max_journeys=max_journeys, verify=verify, force=force)
         )
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         err.print(f"[bold red]Write failed:[/] {type(e).__name__}: {e}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
     finally:
         _report_usage(recorder)
 
@@ -374,9 +397,7 @@ def write(
             console.print(f"  [dim]·[/] {r.path.name}  [dim](confidence: {r.confidence})[/]{tag}")
         if verify:
             n_failed = sum(1 for r in report.written if r.runtime_failed)
-            verdict = (
-                f"[red]{n_failed} still failing[/]" if n_failed else "[green]all passing[/]"
-            )
+            verdict = f"[red]{n_failed} still failing[/]" if n_failed else "[green]all passing[/]"
             console.print(f"[dim]--verify:[/] ran drafted tests once — {verdict}.")
     if report.quarantined:
         console.print(
@@ -414,7 +435,7 @@ def _scaffold_dirs(into: Path) -> list[Path]:
 
 @app.command()
 def enable(
-    tests: Optional[list[str]] = typer.Argument(
+    tests: list[str] | None = typer.Argument(
         None,
         help="Test(s) to enable, e.g. 'test_create_pet' or 'create_pet.py'. "
         "Omit (and skip --all) to just list the skipped drafts.",
@@ -425,9 +446,7 @@ def enable(
         "-i",
         help="A scaffold directory, or a parent of scaffolds to scan (default: projects/).",
     ),
-    all_: bool = typer.Option(
-        False, "--all", help="Enable EVERY skipped destructive draft found."
-    ),
+    all_: bool = typer.Option(False, "--all", help="Enable EVERY skipped destructive draft found."),
 ) -> None:
     """Lift the safety skip on destructive draft(s) so they run ('skipped' → 'ok').
 
@@ -486,16 +505,16 @@ def scaffold(
     inventory_path: Path = typer.Argument(
         ..., exists=True, dir_okay=False, help="Path to a CoverageInventory JSON file."
     ),
-    out: Optional[Path] = typer.Option(
+    out: Path | None = typer.Option(
         None, "--out", "-o", help="Directory to scaffold into. Defaults to projects/<system-name>."
     ),
 ) -> None:
     """Scaffold a runnable pytest + Playwright project from an inventory (deterministic, no LLM)."""
     try:
         inv = CoverageInventory.model_validate_json(inventory_path.read_text(encoding="utf-8"))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         err.print(f"[bold red]Invalid inventory:[/] {type(e).__name__}: {e}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
     if out is None:
         out = Path(PROJECTS_ROOT) / slugify(inv.system_name)
@@ -506,9 +525,9 @@ def scaffold(
     console.print(f"[dim]Scaffolding[/] [bold]{inv.system_name}[/] [dim]→[/] {out} [dim]…[/]")
     try:
         scaffold_project(inv, out, overwrite=True)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         err.print(f"[bold red]Scaffold failed:[/] {type(e).__name__}: {e}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
     files = sorted(p.relative_to(out).as_posix() for p in out.rglob("*") if p.is_file())
     console.print(f"\n[green]✓[/] Scaffolded {len(files)} files into [bold]{out}[/]:")

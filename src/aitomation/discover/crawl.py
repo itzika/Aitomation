@@ -154,20 +154,23 @@ def _field_locator(raw: dict) -> tuple[str | None, str]:
         return f"locator('[name=\"{raw['name']}\"]')", raw["name"]
     return None, "field"
 
+
 _BUTTONS_JS = """
 () => Array.from(document.querySelectorAll('button, [role=button], input[type=submit]'))
   .map(b => (b.innerText || b.value || b.getAttribute('aria-label') || '').trim())
   .filter(Boolean)
 """
 
-_LINKS_JS = "() => Array.from(document.querySelectorAll('a[href]')).map(a => a.getAttribute('href'))"
+_LINKS_JS = (
+    "() => Array.from(document.querySelectorAll('a[href]')).map(a => a.getAttribute('href'))"
+)
 
 
 def _bound_aria(snapshot: str) -> str:
     """Keep the a11y snapshot prompt-sized: drop noisy /url lines, cap line count."""
     lines = [ln for ln in snapshot.splitlines() if ln.strip() and "/url:" not in ln]
     if len(lines) > MAX_ARIA_LINES:
-        lines = lines[:MAX_ARIA_LINES] + ["  - …(truncated)"]
+        lines = [*lines[:MAX_ARIA_LINES], "  - …(truncated)"]
     return "\n".join(lines)
 
 
@@ -185,9 +188,7 @@ async def extract_page(page, depth: int) -> PageArtifact:  # page: playwright Pa
         for rf in raw_forms:
             for raw in rf["fields"]:
                 raw["_loc"], raw["_human"] = _field_locator(raw)
-        loc_counts = Counter(
-            raw["_loc"] for rf in raw_forms for raw in rf["fields"] if raw["_loc"]
-        )
+        loc_counts = Counter(raw["_loc"] for rf in raw_forms for raw in rf["fields"] if raw["_loc"])
         for rf in raw_forms:
             fields = []
             for raw in rf["fields"]:
@@ -215,7 +216,7 @@ async def extract_page(page, depth: int) -> PageArtifact:  # page: playwright Pa
         artifact.buttons = (await page.evaluate(_BUTTONS_JS))[:20]
         hrefs = await page.evaluate(_LINKS_JS)
         artifact.links = normalize_links(url, hrefs)[:MAX_LINKS_PER_PAGE]
-    except Exception as e:  # noqa: BLE001 — one broken page shouldn't abort the crawl
+    except Exception as e:
         artifact.error = f"{type(e).__name__}: {e}"
     return artifact
 
@@ -251,8 +252,10 @@ async def crawl_site(
 
             try:
                 await page.goto(url, wait_until="domcontentloaded")
-            except Exception as e:  # noqa: BLE001
-                broken = PageArtifact(url=url, title="", depth=depth, error=f"{type(e).__name__}: {e}")
+            except Exception as e:
+                broken = PageArtifact(
+                    url=url, title="", depth=depth, error=f"{type(e).__name__}: {e}"
+                )
                 result.pages.append(broken)
                 if on_page is not None:
                     on_page(broken)
@@ -295,7 +298,9 @@ def render_crawl(result: CrawlResult) -> str:
             fields = ", ".join(
                 f"{fld.name}{'*' if fld.required else ''}:{fld.type}" for fld in form.fields
             )
-            lines.append(f"   form{tag}: {form.method.upper()} {form.action or '(self)'} — {fields}")
+            lines.append(
+                f"   form{tag}: {form.method.upper()} {form.action or '(self)'} — {fields}"
+            )
         if p.buttons:
             lines.append("   buttons: " + ", ".join(p.buttons[:15]))
         lines.append("")
@@ -333,22 +338,32 @@ def elements_from_crawl(result: CrawlResult) -> list[TestableElement]:
         page_name = _unique(_name_from_route(route), seen)
         elements.append(
             TestableElement(
-                kind="page", name=page_name, location=route,
-                description=p.title or route, priority="medium",
+                kind="page",
+                name=page_name,
+                location=route,
+                description=p.title or route,
+                priority="medium",
             )
         )
         for idx, form in enumerate(p.forms):
             base = f"{page_name}_form" if len(p.forms) == 1 else f"{page_name}_form_{idx + 1}"
             inputs = [
                 InputField(
-                    name=f.name, type=f.type, required=f.required, where="form",
-                    description=f.human or None, locator=f.locator, unique=f.unique,
+                    name=f.name,
+                    type=f.type,
+                    required=f.required,
+                    where="form",
+                    description=f.human or None,
+                    locator=f.locator,
+                    unique=f.unique,
                 )
                 for f in form.fields
             ]
             elements.append(
                 TestableElement(
-                    kind="form", name=_unique(base, seen), location=route,
+                    kind="form",
+                    name=_unique(base, seen),
+                    location=route,
                     # carry the form's HTTP method so a POST form is correctly treated as
                     # destructive (skipped by default); a GET search form is not.
                     method=(form.method or "get").upper(),
@@ -421,7 +436,9 @@ async def discover_crawl(
         journey.elements = [n for n in journey.elements if n in names]
 
     home = next((p for p in result.pages if not p.error and _route(p.url) in ("/", "")), None)
-    system_name = (home.title if home and home.title else "") or urlsplit(base_url).netloc or base_url
+    system_name = (
+        (home.title if home and home.title else "") or urlsplit(base_url).netloc or base_url
+    )
     return CoverageInventory(
         system_name=system_name,
         base_url=base_url,

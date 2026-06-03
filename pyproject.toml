@@ -24,6 +24,8 @@ aitomation = "aitomation.cli:main"
 dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.4.0",
+    "ruff>=0.15.15",
+    "ty>=0.0.42",
 ]
 
 [build-system]
@@ -38,3 +40,22 @@ artifacts = ["src/aitomation/scaffold/template/**"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"  # match requires-python floor so UP rules don't suggest 3.13-only syntax
+# Never lint generated output or the Copier template (ships .jinja, not valid standalone Python).
+extend-exclude = ["src/aitomation/scaffold/template", "projects", "e2e", ".aitomation"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PIE", "RUF"]
+ignore = [
+    "E501",   # line length is the formatter's responsibility; don't double-enforce on strings/comments
+    "B008",   # Typer Option()/Argument() defaults are the framework's intended DI pattern
+    "RUF012", # Textual BINDINGS/CSS-style mutable class attrs are framework idioms, not bugs
+    "UP047",  # classic TypeVar style is used deliberately (module T shared by the protocol + helpers)
+    "SIM102", # nested guards are kept for parallel readability (web/api/event/data each a top-level if)
+]
+
+[tool.ty.environment]
+python-version = "3.12"

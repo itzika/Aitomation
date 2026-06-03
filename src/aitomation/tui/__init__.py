@@ -3,4 +3,4 @@
 from .app import AitomationApp, run
 from .workspace import SystemRecord, Workspace
 
-__all__ = ["AitomationApp", "run", "Workspace", "SystemRecord"]
+__all__ = ["AitomationApp", "SystemRecord", "Workspace", "run"]

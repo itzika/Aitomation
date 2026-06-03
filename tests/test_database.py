@@ -120,7 +120,9 @@ class _FakeJudge:
     async def generate(self, prompt, *, system=None, label=""):  # pragma: no cover
         return ""
 
-    async def generate_structured(self, prompt, schema: type[T], *, system=None, label: str = "") -> T:
+    async def generate_structured(
+        self, prompt, schema: type[T], *, system=None, label: str = ""
+    ) -> T:
         self.last_system = system
         return schema(
             system_summary="An e-commerce schema.",

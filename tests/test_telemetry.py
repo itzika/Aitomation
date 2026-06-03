@@ -17,17 +17,17 @@ class _FakeUsage:
 
 def _rec(**kw):
     """Helper to record one call with sensible defaults."""
-    defaults = dict(
-        label="discover.openapi",
-        provider="dashscope",
-        model="qwen3-max",
-        system="sys",
-        user="prompt body",
-        usage=_FakeUsage(input_tokens=100, output_tokens=40),
-        duration_s=1.5,
-        started_at="t0",
-        ended_at="t1",
-    )
+    defaults = {
+        "label": "discover.openapi",
+        "provider": "dashscope",
+        "model": "qwen3-max",
+        "system": "sys",
+        "user": "prompt body",
+        "usage": _FakeUsage(input_tokens=100, output_tokens=40),
+        "duration_s": 1.5,
+        "started_at": "t0",
+        "ended_at": "t1",
+    }
     defaults.update(kw)
     return defaults
 
@@ -40,8 +40,11 @@ def test_record_captures_tokens_and_prompt():
     assert rec.run_id == "run1" and rec.app == "Demo"
     assert rec.user_prompt == "prompt body" and rec.system_prompt == "sys"
     assert r.totals == {
-        "calls": 1, "input_tokens": 100, "output_tokens": 40,
-        "total_tokens": 140, "duration_s": 1.5,
+        "calls": 1,
+        "input_tokens": 100,
+        "output_tokens": 40,
+        "total_tokens": 140,
+        "duration_s": 1.5,
     }
 
 
@@ -87,12 +90,33 @@ def test_flush_noop_when_empty(tmp_path):
 
 def test_aggregate_groups_and_sums():
     records = [
-        {"app": "A", "model": "m1", "label": "discover.openapi",
-         "input_tokens": 100, "output_tokens": 40, "total_tokens": 140, "duration_s": 1.0},
-        {"app": "A", "model": "m1", "label": "write:test_x",
-         "input_tokens": 50, "output_tokens": 20, "total_tokens": 70, "duration_s": 0.5},
-        {"app": "B", "model": "m2", "label": "discover.openapi",
-         "input_tokens": 10, "output_tokens": 5, "total_tokens": 15, "duration_s": 0.2},
+        {
+            "app": "A",
+            "model": "m1",
+            "label": "discover.openapi",
+            "input_tokens": 100,
+            "output_tokens": 40,
+            "total_tokens": 140,
+            "duration_s": 1.0,
+        },
+        {
+            "app": "A",
+            "model": "m1",
+            "label": "write:test_x",
+            "input_tokens": 50,
+            "output_tokens": 20,
+            "total_tokens": 70,
+            "duration_s": 0.5,
+        },
+        {
+            "app": "B",
+            "model": "m2",
+            "label": "discover.openapi",
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "total_tokens": 15,
+            "duration_s": 0.2,
+        },
     ]
     by_app_model = aggregate(records, ("app", "model"))
     assert len(by_app_model) == 2

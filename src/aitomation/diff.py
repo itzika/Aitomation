@@ -62,9 +62,7 @@ def element_fingerprint(e: TestableElement) -> str:
     """Hash of only the fields that, if changed, can make an existing test wrong: method,
     path, kind, and each input's (name, where, type, required). Description/priority/example
     are advisory and deliberately excluded — they don't invalidate a drafted test."""
-    inputs = sorted(
-        (i.name, (i.where or ""), (i.type or ""), bool(i.required)) for i in e.inputs
-    )
+    inputs = sorted((i.name, (i.where or ""), (i.type or ""), bool(i.required)) for i in e.inputs)
     payload = (
         (e.method or "").upper(),
         e.location,

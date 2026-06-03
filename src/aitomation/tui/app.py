@@ -9,6 +9,7 @@ land in visible, timestamped per-run directories under each tested app.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import random
@@ -33,6 +34,7 @@ from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import (
     Button,
+    Collapsible,
     DataTable,
     Footer,
     Input,
@@ -53,12 +55,12 @@ from ..discover.crawl import discover_crawl
 from ..discover.database import discover_db
 from ..discover.openapi import discover_openapi
 from ..discover.registry import discover_registry
+from ..naming import PROJECTS_ROOT
 from ..providers import LLMProvider, PydanticAIProvider
 from ..scaffold import scaffold_project
 from ..scaffold.generator import _func_name
 from ..telemetry import DEFAULT_LOG, UsageRecorder, aggregate, load_records
 from ..write import draft_tests, enable_drafts, heal_failing_tests, select_journeys
-from ..naming import PROJECTS_ROOT
 from .workspace import SystemRecord, Workspace, slugify
 
 # Restrained dark: ONE cyan accent on cool neutral darks. The old neon triad (cyan + magenta +
@@ -68,16 +70,16 @@ from .workspace import SystemRecord, Workspace, slugify
 # neutral (a literal in CSS, since custom theme vars aren't available when App.CSS is parsed).
 CYBERPUNK = Theme(
     name="cyberpunk",
-    primary="#22d3ee",     # cyan — the single accent (focus, modal borders, matches the banner)
-    secondary="#5b6b7f",   # muted slate (was magenta)
-    accent="#22d3ee",      # keep the accent in the cyan family (was neon green)
+    primary="#22d3ee",  # cyan — the single accent (focus, modal borders, matches the banner)
+    secondary="#5b6b7f",  # muted slate (was magenta)
+    accent="#22d3ee",  # keep the accent in the cyan family (was neon green)
     foreground="#cde7f0",
     background="#080b12",
     surface="#0e1320",
     panel="#141b2d",
-    success="#56d39a",     # soft green (was neon #56d39a)
-    warning="#e0b341",     # muted amber (was neon #e0b341)
-    error="#f2647b",       # rose (was neon #f2647b)
+    success="#56d39a",  # soft green (was neon #56d39a)
+    warning="#e0b341",  # muted amber (was neon #e0b341)
+    error="#f2647b",  # rose (was neon #f2647b)
     dark=True,
     variables={
         "block-cursor-foreground": "#080b12",
@@ -115,7 +117,8 @@ A system moves through three stages, shown as dots in the library: \
   Flows     suggested end-to-end paths; select for steps
   Tests     drafts + source preview; status reflects the last run (passed / failed /
             skipped / needs review)
-  Usage     LLM token cost for this system, by prompt
+  Usage     this system's LLM cost: animated meters, ~$ estimate, the exact
+            model(s) used, and a per-run breakdown you can expand
 
 [dim]press any key to close[/]"""
 
@@ -163,6 +166,109 @@ def _parse_pytest_outcomes(lines: list[str]) -> dict[str, str]:
             out[name] = outcome
     return {n: ("failed" if o == "error" else o) for n, o in out.items()}
 
+
+# --- Usage tab: cost model + little graphics ------------------------------------------
+# Approximate public list prices in USD per 1M tokens (input, output) — matched by model-name
+# FAMILY so versioned names ('claude-opus-4-8', 'qwen-plus-latest') resolve without an
+# exact-match table. These give an at-a-glance "~$" estimate only; unknown models are omitted
+# from the cost sum (and counted so the UI can say "N unpriced"). Easy to update; never billed on.
+def _price_for(provider: str, model: str) -> tuple[float, float] | None:
+    m = (model or "").lower()
+    if "opus" in m:
+        return (15.0, 75.0)
+    if "sonnet" in m:
+        return (3.0, 15.0)
+    if "haiku" in m:
+        return (0.8, 4.0)
+    if "coder" in m:
+        return (1.0, 5.0)
+    if "max" in m:  # qwen-max / qwen3-max
+        return (1.6, 6.4)
+    if "turbo" in m:  # qwen-turbo
+        return (0.05, 0.2)
+    if "plus" in m:  # qwen-plus
+        return (0.4, 1.2)
+    if "gpt-4.1-mini" in m:
+        return (0.4, 1.6)
+    if "gpt-4.1" in m:
+        return (2.0, 8.0)
+    if "gpt-4o-mini" in m:
+        return (0.15, 0.6)
+    if "gpt-4o" in m or "gpt-4" in m:
+        return (2.5, 10.0)
+    return None
+
+
+def _cost_of(r: dict) -> float:
+    """Estimated USD for one call record (0 if its model isn't in the price table)."""
+    price = _price_for(r.get("provider", ""), r.get("model", ""))
+    if not price:
+        return 0.0
+    return (
+        int(r.get("input_tokens", 0)) / 1e6 * price[0]
+        + int(r.get("output_tokens", 0)) / 1e6 * price[1]
+    )
+
+
+# Pipeline stage a usage record belongs to, derived from its label ('discover.crawl',
+# 'write:test_x', 'fix:test_x') — used to colour and break down the meters by stage.
+_STAGE_STYLE = {"discover": "#22d3ee", "write": "#56d39a", "fix": "#e0b341", "other": "#7f8ea3"}
+_EIGHTHS = " ▏▎▍▌▋▊▉█"  # 0/8 .. 8/8 of a cell, for sub-cell meter precision
+_SPARK = "▁▂▃▄▅▆▇█"
+
+
+def _stage_of(label: str) -> str:
+    s = str(label)
+    if s.startswith("discover"):
+        return "discover"
+    if s.startswith("write:"):
+        return "write"
+    if s.startswith("fix:"):
+        return "fix"
+    return "other"
+
+
+def _run_stamp(iso: str) -> str:
+    """Short local 'MM-DD HH:MM' stamp for a run, from a record's ISO started_at."""
+    try:
+        return datetime.fromisoformat(iso).astimezone().strftime("%m-%d %H:%M")
+    except (ValueError, TypeError):
+        return "—"
+
+
+def _bar(ratio: float, width: int, style: str, *, track: str = "#1b2533") -> Text:
+    """A horizontal meter `width` cells wide, filled to `ratio` (0..1) with 1/8-cell precision."""
+    ratio = max(0.0, min(1.0, ratio))
+    cells = ratio * width
+    full = int(cells)
+    out = Text("█" * min(full, width), style=style)
+    rem = width - full
+    if rem > 0:
+        eighth = _EIGHTHS[round((cells - full) * 8)]
+        if eighth != " ":
+            out.append(eighth, style=style)
+            rem -= 1
+        if rem > 0:
+            out.append("░" * rem, style=track)
+    return out
+
+
+def _sparkline(values: list[float], *, scale: float = 1.0) -> str:
+    """One-line bar sparkline of `values`, each scaled to the series max (x `scale`, so a
+    growing scale animates the whole line rising from the baseline)."""
+    if not values:
+        return ""
+    hi = max(values) or 1.0
+    n = len(_SPARK) - 1
+    return "".join(_SPARK[max(0, min(n, int(v * scale / hi * n)))] for v in values)
+
+
+def _ascii_bar(ratio: float, width: int = 8) -> str:
+    """A monochrome block bar (for plain-text contexts like a Collapsible title)."""
+    k = max(0, min(width, round(max(0.0, min(1.0, ratio)) * width)))
+    return "█" * k + "░" * (width - k)
+
+
 # Editors offered by the "open run folder" picker (o): (display, CLI candidates, macOS .app
 # name prefixes). GUI editors on macOS rarely put their CLI on PATH (only Cursor tends to),
 # so we detect/launch by .app bundle there; CLI is the fallback (and the Linux/Windows path).
@@ -178,7 +284,9 @@ _MACOS = sys.platform == "darwin"
 _APP_ROOTS: tuple[Path, ...] = (Path("/Applications"), Path.home() / "Applications")
 
 
-def _find_app_bundle(prefixes: tuple[str, ...], roots: tuple[Path, ...] | None = None) -> Path | None:
+def _find_app_bundle(
+    prefixes: tuple[str, ...], roots: tuple[Path, ...] | None = None
+) -> Path | None:
     """Locate an installed .app for one of `prefixes`, exact name first then prefix match."""
     roots = roots if roots is not None else _APP_ROOTS
     for pre in prefixes:
@@ -194,7 +302,9 @@ def _find_app_bundle(prefixes: tuple[str, ...], roots: tuple[Path, ...] | None =
     return None
 
 
-def _resolve_editor(cli_candidates: tuple[str, ...], app_prefixes: tuple[str, ...]) -> list[str] | None:
+def _resolve_editor(
+    cli_candidates: tuple[str, ...], app_prefixes: tuple[str, ...]
+) -> list[str] | None:
     """Return the argv prefix that launches this editor (the run dir is appended later), or
     None if it isn't installed. On macOS prefer `open -a <bundle>` since the CLI is usually
     absent; everywhere else (and as a fallback) use the CLI launcher if it's on PATH."""
@@ -385,6 +495,91 @@ class MatrixBanner(Static):
         self.app.action_choose_model()
 
 
+class UsageMeters(Static):
+    """The Usage-tab summary: hero token + ~cost totals, the model(s) used as chips, in/out
+    and per-stage meters, and a per-run cost sparkline. On mount the meters ease 0→value and
+    the totals count up once, then settle — motion on a discrete event (selecting a system),
+    like the header band that pauses during work, never a perpetual backdrop."""
+
+    DEFAULT_CSS = """
+    UsageMeters { height: auto; padding: 1 2 0 2; }
+    """
+
+    def __init__(self, data: dict) -> None:
+        super().__init__()
+        self._data = data
+        self._anim = 0.0
+        self._timer = None
+
+    def on_mount(self) -> None:
+        self._timer = self.set_interval(1 / 30, self._tick)
+
+    def _tick(self) -> None:
+        self._anim = min(1.0, self._anim + 1 / 14)  # ~0.5s fill-in
+        if self._anim >= 1.0 and self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+        self.refresh()
+
+    @staticmethod
+    def _chip(model: str, *, primary: bool) -> Text:
+        label = model if len(model) <= 24 else model[:23] + "…"
+        style = "bold #06222b on #22d3ee" if primary else "#cde7f0 on #243244"
+        return Text(f" {label} ", style=style)
+
+    def render(self) -> Text:
+        d = self._data
+        if not d:
+            return Text("")
+        e = 1 - (1 - self._anim) ** 3  # ease-out: snappy fill, gentle landing
+        total = d["total"] or 1
+        W = 26
+        t = Text()
+        # hero: token total (counting up) + estimated cost + call/latency tallies
+        t.append(f"{round(d['total'] * e):,}", style="bold #22d3ee")
+        t.append(" tok", style="#7f8ea3")
+        if d["cost"] > 0:
+            t.append("    ")
+            t.append(f"~${d['cost'] * e:,.2f}", style="bold #56d39a")
+            t.append(" est", style="dim #56d39a")
+        t.append(f"    {d['calls']} calls", style="#7f8ea3")
+        if d["duration"]:
+            t.append(f" · {d['duration']:.0f}s", style="#7f8ea3")
+        t.append("\n")
+        # model chips — the EXACT model(s) this system was discovered/written with
+        for i, m in enumerate(d["models"]):
+            if i:
+                t.append(" ")
+            t.append_text(self._chip(m, primary=(i == 0)))
+        if d["unpriced"]:
+            t.append(f"   {d['unpriced']} unpriced", style="dim #7f8ea3")
+        t.append("\n\n")
+        # in / out token meters
+        for name, val, style in (("in ", d["input"], "#22d3ee"), ("out", d["output"], "#5b6b7f")):
+            t.append(f"{name} ", style="#7f8ea3")
+            t.append_text(_bar(val / total * e, W, style))
+            t.append(f"  {val:,}\n", style="#9fb0c0")
+        if d["cache"]:
+            pct = d["cache"] / max(d["input"], 1) * 100
+            t.append("cache ", style="#7f8ea3")
+            t.append(f"{d['cache']:,} tok", style="#9fb0c0")
+            t.append(f"  ({pct:.0f}% of input reused)\n", style="dim #7f8ea3")
+        # per-stage breakdown — where the cost actually goes
+        if d["stages"]:
+            t.append("\n")
+            for stage, tok in d["stages"]:
+                style = _STAGE_STYLE.get(stage, "#7f8ea3")
+                t.append(f"{stage:<9}", style=style)
+                t.append_text(_bar(tok / total * e, W, style))
+                t.append(f"  {tok / total * 100:.0f}%\n", style="#9fb0c0")
+        # per-run cost trend (rising as the animation scales the bars up)
+        if len(d["spark"]) > 1:
+            t.append("\ntok/run ", style="#7f8ea3")
+            t.append(_sparkline(d["spark"], scale=e), style="#22d3ee")
+            t.append(f"  ({len(d['spark'])} runs)\n", style="dim #7f8ea3")
+        return t
+
+
 class ModelScreen(ModalScreen[dict | None]):
     """Pick the provider + model the toolkit talks to. The header shows the active one;
     clicking it (or pressing m) opens this. Switching is BYO-key: a backend with no key
@@ -478,7 +673,11 @@ _WIZARD_SOURCES: tuple[tuple[str, str, str], ...] = (
     ("crawl", "Crawl a running web app  (URL)", "https://app.example.com"),
     ("asyncapi", "AsyncAPI spec  (file or URL)", "./asyncapi.yaml  or  https://…/asyncapi.json"),
     ("registry", "Schema registry  (live URL)", "http://localhost:8081"),
-    ("db", "Database  (connection URL or .sql DDL)", "postgresql://user@host/db   or   ./schema.sql"),
+    (
+        "db",
+        "Database  (connection URL or .sql DDL)",
+        "postgresql://user@host/db   or   ./schema.sql",
+    ),
 )
 
 
@@ -528,7 +727,9 @@ class WizardScreen(ModalScreen[dict | None]):
     def _submit(self) -> None:
         origin = self.query_one("#origin", Input).value.strip()
         if not origin:
-            self.notify("Enter a spec/app URL, connection string, or file path.", severity="warning")
+            self.notify(
+                "Enter a spec/app URL, connection string, or file path.", severity="warning"
+            )
             return
         idx = self.query_one("#source", RadioSet).pressed_index
         source = _WIZARD_SOURCES[idx][0] if 0 <= idx < len(_WIZARD_SOURCES) else "openapi"
@@ -658,6 +859,12 @@ class AitomationApp(App):
     #progress { width: 32; display: none; padding: 0 1; }
     #status { width: 1fr; padding: 0 1; color: $accent; }
     DataTable { height: 1fr; background: $surface; }
+    #usage { background: $surface; }
+    .usage-empty { padding: 1 2; }
+    .usage-run { background: $surface; margin: 0 1; }
+    .usage-run > CollapsibleTitle { color: #9fb0c0; }
+    .usage-run > CollapsibleTitle:hover { color: #22d3ee; background: $foreground 8%; }
+    .usage-run-body { padding: 0 1 1 2; color: #9fb0c0; }
     .detail { height: auto; max-height: 14; padding: 1; border-top: solid #243240; }
     HeaderTitle:hover { background: $foreground 10%; }
     #wizard { width: 64; height: auto; padding: 1 2; background: $surface; border: round $primary; }
@@ -744,20 +951,17 @@ class AitomationApp(App):
             with TabbedContent(id="tabs"):
                 with TabPane("Overview", id="tab-overview"):
                     yield VerticalScroll(Static(id="overview"))
-                with TabPane("Coverage", id="tab-surface"):
-                    with Vertical():
-                        yield DataTable(id="surface", cursor_type="row")
-                        yield Static(id="surface-detail", classes="detail")
-                with TabPane("Flows", id="tab-journeys"):
-                    with Vertical():
-                        yield DataTable(id="journeys", cursor_type="row")
-                        yield Static(id="journeys-detail", classes="detail")
-                with TabPane("Tests", id="tab-tests"):
-                    with Vertical():
-                        yield DataTable(id="tests", cursor_type="row")
-                        yield VerticalScroll(Static(id="tests-detail"), classes="detail")
+                with TabPane("Coverage", id="tab-surface"), Vertical():
+                    yield DataTable(id="surface", cursor_type="row")
+                    yield Static(id="surface-detail", classes="detail")
+                with TabPane("Flows", id="tab-journeys"), Vertical():
+                    yield DataTable(id="journeys", cursor_type="row")
+                    yield Static(id="journeys-detail", classes="detail")
+                with TabPane("Tests", id="tab-tests"), Vertical():
+                    yield DataTable(id="tests", cursor_type="row")
+                    yield VerticalScroll(Static(id="tests-detail"), classes="detail")
                 with TabPane("Usage", id="tab-usage"):
-                    yield VerticalScroll(Static(id="usage"))
+                    yield VerticalScroll(id="usage")
         log = RichLog(id="log", markup=True, highlight=False, wrap=True)
         log.border_title = "live log"
         yield log
@@ -799,7 +1003,9 @@ class AitomationApp(App):
             self.sub_title = f"{self._config.backend}:{self._config.model}"
         except ConfigError:
             self.sub_title = "no LLM key"
-            self._log("[#e0b341]no LLM configured[/] — browse/scaffold work; discover/write need a key")
+            self._log(
+                "[#e0b341]no LLM configured[/] — browse/scaffold work; discover/write need a key"
+            )
 
     def _provider_ready(self) -> bool:
         if self._llm is None:
@@ -833,7 +1039,9 @@ class AitomationApp(App):
         self._config = cfg
         self._llm = PydanticAIProvider(cfg, self.recorder)
         self.sub_title = f"{cfg.backend}:{cfg.model}"
-        self._log(f"[#56d39a]model[/] → {cfg.backend}:{cfg.model} [dim](output: {cfg.output_mode})[/]")
+        self._log(
+            f"[#56d39a]model[/] → {cfg.backend}:{cfg.model} [dim](output: {cfg.output_mode})[/]"
+        )
 
     # -- log + status -------------------------------------------------------------------
 
@@ -845,10 +1053,8 @@ class AitomationApp(App):
 
     def _set_banner_paused(self, paused: bool) -> None:
         # Freeze the header animation around long operations; tolerate the banner being absent.
-        try:
+        with contextlib.suppress(Exception):
             self.query_one(MatrixBanner).pause(paused)
-        except Exception:  # noqa: BLE001 — purely cosmetic, never block an op on it
-            pass
 
     def _begin_progress(self, total: int | None, label: str) -> None:
         bar = self.query_one("#progress", ProgressBar)
@@ -883,7 +1089,7 @@ class AitomationApp(App):
         if action == "enable_test":
             try:
                 sel = self._selected_test()
-            except Exception:  # noqa: BLE001 — DOM may not be ready during early mount
+            except Exception:
                 return False
             return bool(sel and "skip" in sel[1])
         return True
@@ -963,10 +1169,8 @@ class AitomationApp(App):
 
     def _save_outcomes(self, run: Path) -> None:
         """Persist the current per-file outcomes next to pytest-output.txt (see _load_outcomes)."""
-        try:
+        with contextlib.suppress(OSError):
             (run / _STATUS_FILE).write_text(json.dumps(self._test_outcomes), encoding="utf-8")
-        except OSError:
-            pass
 
     def _current_index(self) -> int:
         for i, r in enumerate(self.workspace.list_systems()):
@@ -992,8 +1196,9 @@ class AitomationApp(App):
         )
         for tid in ("surface", "journeys", "tests"):
             self.query_one(f"#{tid}", DataTable).clear()
-        for did in ("surface-detail", "journeys-detail", "tests-detail", "usage"):
+        for did in ("surface-detail", "journeys-detail", "tests-detail"):
             self.query_one(f"#{did}", Static).update("")
+        self.query_one("#usage", VerticalScroll).remove_children()
 
     @staticmethod
     def _next_hint(rec: SystemRecord) -> str:
@@ -1010,8 +1215,13 @@ class AitomationApp(App):
         writes = [r for r in recs if str(r["label"]).startswith("write:")]
         n = len(writes)
         wt = sum(r["total_tokens"] for r in writes)
-        return {"any": bool(recs), "discover": disc, "n_tests": n, "write_total": wt,
-                "avg": round(wt / n) if n else 0}
+        return {
+            "any": bool(recs),
+            "discover": disc,
+            "n_tests": n,
+            "write_total": wt,
+            "avg": round(wt / n) if n else 0,
+        }
 
     def _render_overview(self) -> None:
         inv, rec = self.current_inv, self.current
@@ -1053,7 +1263,9 @@ class AitomationApp(App):
         # action bar — green ✓ once a stage is done (kept above the fold)
         body.append("\nactions   ")
         body.append("[ s ] scaffold ", style="dim")
-        body.append("✓" if rec.scaffolded else "·", style="#56d39a" if rec.scaffolded else "#39455c")
+        body.append(
+            "✓" if rec.scaffolded else "·", style="#56d39a" if rec.scaffolded else "#39455c"
+        )
         body.append("   [ w ] write tests ", style="dim")
         body.append("✓" if rec.drafted else "·", style="#56d39a" if rec.drafted else "#39455c")
         body.append("   [ r ] re-discover\n", style="dim")
@@ -1062,8 +1274,13 @@ class AitomationApp(App):
             body.append("\nrun       ", style="bold #7f8ea3")
             body.append("[ t ] run pytest here   [ o ] open in editor\n", style="dim")
             body.append(f"  cd {rec.latest_run}\n", style="dim")
-            body.append("  uv sync && uv run playwright install chromium && uv run pytest -ra\n", style="dim")
-            body.append("  # containerised:  docker build -t e2e . && docker run --rm e2e\n", style="dim")
+            body.append(
+                "  uv sync && uv run playwright install chromium && uv run pytest -ra\n",
+                style="dim",
+            )
+            body.append(
+                "  # containerised:  docker build -t e2e . && docker run --rm e2e\n", style="dim"
+            )
             body.append(f"\noutput    {rec.latest_run}\n", style="dim")
         if inv.summary:
             body.append(f"\n{inv.summary}\n")
@@ -1173,24 +1390,140 @@ class AitomationApp(App):
             Syntax(code, "python", theme="ansi_dark", word_wrap=True)
         )
 
+    def _records_for_current(self) -> list[dict]:
+        """This system's usage records — flushed (on disk) plus the current session's
+        in-memory ones. Discover records are tagged with the ORIGIN (the spec/URL crawled),
+        while write/fix are tagged with the system name (the recorder.app is flipped mid-
+        discover); we match BOTH so the per-system view includes discovery cost, not just
+        write+fix. The set dedupes when a system's name and origin are the same string."""
+        ids = {self.current.name, self.current.origin}
+        recs = [r for r in load_records(self.recorder.log_path) if r.get("app") in ids]
+        recs += [r.to_dict() for r in self.recorder.records if r.app in ids]
+        return recs
+
+    @staticmethod
+    def _usage_data(records: list[dict]) -> dict:
+        """Shape this system's call records into the Usage tab's view model: overall totals,
+        ~cost, the models used (most-used first), per-stage tokens, a per-run cost series for
+        the sparkline, and one collapsible-ready summary per run (newest first)."""
+        by_run: dict[str, list[dict]] = {}
+        for r in records:
+            by_run.setdefault(str(r.get("run_id", "")), []).append(r)
+
+        def start(rs: list[dict]) -> str:
+            return min((x.get("started_at", "") for x in rs), default="")
+
+        run_items = sorted(by_run.items(), key=lambda kv: start(kv[1]))  # oldest → newest
+        spark = [sum(int(x.get("total_tokens", 0)) for x in rs) for _, rs in run_items]
+        runs = []
+        for rid, rs in reversed(run_items):  # newest first for display
+            models: list[str] = []
+            for x in rs:
+                mm = x.get("model", "")
+                if mm and mm not in models:
+                    models.append(mm)
+            in_t = sum(int(x.get("input_tokens", 0)) for x in rs)
+            out_t = sum(int(x.get("output_tokens", 0)) for x in rs)
+            runs.append(
+                {
+                    "id": rid,
+                    "stamp": _run_stamp(start(rs)),
+                    "models": models,
+                    "calls": len(rs),
+                    "input": in_t,
+                    "output": out_t,
+                    "total": in_t + out_t,
+                    "cost": sum(_cost_of(x) for x in rs),
+                    "rows": aggregate(rs, ("label",)),
+                }
+            )
+        model_tok: dict[str, int] = {}
+        stage_tok: dict[str, int] = {}
+        for r in records:
+            model_tok[r.get("model", "")] = model_tok.get(r.get("model", ""), 0) + int(
+                r.get("total_tokens", 0)
+            )
+            st = _stage_of(r.get("label", ""))
+            stage_tok[st] = stage_tok.get(st, 0) + int(r.get("total_tokens", 0))
+        models = [m for m, _ in sorted(model_tok.items(), key=lambda kv: kv[1], reverse=True) if m]
+        stages = [
+            (s, stage_tok[s]) for s in ("discover", "write", "fix", "other") if stage_tok.get(s)
+        ]
+        unpriced = len(
+            {
+                r.get("model", "")
+                for r in records
+                if r.get("model") and _price_for(r.get("provider", ""), r.get("model", "")) is None
+            }
+        )
+        return {
+            "calls": len(records),
+            "input": sum(int(r.get("input_tokens", 0)) for r in records),
+            "output": sum(int(r.get("output_tokens", 0)) for r in records),
+            "total": sum(int(r.get("total_tokens", 0)) for r in records),
+            "cache": sum(int(r.get("cache_read_tokens", 0)) for r in records),
+            "duration": sum(float(r.get("duration_s", 0)) for r in records),
+            "cost": sum(_cost_of(r) for r in records),
+            "unpriced": unpriced,
+            "models": models,
+            "stages": stages,
+            "spark": spark,
+            "runs": runs,
+        }
+
+    @staticmethod
+    def _run_title(run: dict, max_total: int) -> str:
+        """Plain-text Collapsible title: when · model(s) · tokens · ~cost · a relative bar."""
+        models = "/".join(run["models"]) or "—"
+        cost = f"~${run['cost']:,.2f}" if run["cost"] > 0 else "—"
+        bar = _ascii_bar(run["total"] / (max_total or 1))
+        return f"{run['stamp']}  {models}  {run['total']:,} tok  {cost}  {bar}"
+
+    @staticmethod
+    def _run_table(run: dict) -> RichTable:
+        """Per-prompt breakdown shown inside an expanded run, stage-coloured by label."""
+        table = RichTable(expand=True, show_edge=False, pad_edge=False)
+        table.add_column("prompt", justify="left", overflow="ellipsis", no_wrap=True)
+        for col in ("calls", "in", "out", "total", "sec"):
+            table.add_column(col, justify="right", style="#9fb0c0")
+        for g in run["rows"]:
+            table.add_row(
+                Text(g["label"], style=_STAGE_STYLE.get(_stage_of(g["label"]), "")),
+                str(g["calls"]),
+                f"{g['input_tokens']:,}",
+                f"{g['output_tokens']:,}",
+                f"{g['total_tokens']:,}",
+                f"{g['duration_s']:.0f}",
+            )
+        return table
+
     def _render_usage(self) -> None:
-        records = [r for r in load_records(self.recorder.log_path) if r.get("app") == self.current.name]
-        records += [r.to_dict() for r in self.recorder.records if r.app == self.current.name]
-        if not records:
-            self.query_one("#usage", Static).update(Text("No LLM usage recorded for this system yet.", style="dim"))
+        if self.current is None:
             return
-        table = RichTable(expand=True)
-        for col in ("prompt", "calls", "in", "out", "total", "sec"):
-            table.add_column(col, justify="left" if col == "prompt" else "right")
-        for g in aggregate(records, ("label",)):
-            table.add_row(g["label"], str(g["calls"]), f"{g['input_tokens']:,}",
-                          f"{g['output_tokens']:,}", f"{g['total_tokens']:,}", f"{g['duration_s']}")
-        total = aggregate(records, ())[0]  # overall total across all prompts
-        table.add_section()
-        table.add_row("TOTAL", str(total["calls"]), f"{total['input_tokens']:,}",
-                      f"{total['output_tokens']:,}", f"{total['total_tokens']:,}",
-                      f"{total['duration_s']}", style="bold #56d39a")
-        self.query_one("#usage", Static).update(table)
+        container = self.query_one("#usage", VerticalScroll)
+        container.remove_children()
+        records = self._records_for_current()
+        if not records:
+            container.mount(
+                Static(
+                    Text("No LLM usage recorded for this system yet.", style="dim"),
+                    classes="usage-empty",
+                )
+            )
+            return
+        data = self._usage_data(records)
+        max_total = max((r["total"] for r in data["runs"]), default=1)
+        widgets: list = [UsageMeters(data)]
+        for i, run in enumerate(data["runs"]):
+            widgets.append(
+                Collapsible(
+                    Static(self._run_table(run), classes="usage-run-body"),
+                    title=self._run_title(run, max_total),
+                    collapsed=(i != 0),
+                    classes="usage-run",
+                )
+            )
+        container.mount(*widgets)
 
     # -- actions ------------------------------------------------------------------------
 
@@ -1222,7 +1555,7 @@ class AitomationApp(App):
         )
         try:
             scaffold_project(self.current_inv, run)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self._log(f"[#f2647b]scaffold failed[/] {escape(str(e))}")
             self.notify(f"Scaffold failed: {e}", severity="error")
             return
@@ -1268,10 +1601,14 @@ class AitomationApp(App):
 
     def action_fix_failing(self) -> None:
         if self.current is None or not self.current.latest_run:
-            self.notify("Nothing to fix — scaffold (s) and run tests (t) first.", severity="warning")
+            self.notify(
+                "Nothing to fix — scaffold (s) and run tests (t) first.", severity="warning"
+            )
             return
         if not self._last_run_failed:
-            self.notify("Nothing to fix — run tests (t) first; fix targets failures.", severity="warning")
+            self.notify(
+                "Nothing to fix — run tests (t) first; fix targets failures.", severity="warning"
+            )
             return
         if self._provider_ready():
             self.run_fix()
@@ -1367,7 +1704,11 @@ class AitomationApp(App):
             self._log(f"  [#56d39a]new flow(s)[/]: {names} — press [b]w[/] to draft them")
         if rec.latest_run and d.affected_journeys:
             tests = Path(rec.latest_run) / "tests"
-            stale = [j.name for j in d.affected_journeys if (tests / f"test_{_func_name(j.name)}.py").exists()]
+            stale = [
+                j.name
+                for j in d.affected_journeys
+                if (tests / f"test_{_func_name(j.name)}.py").exists()
+            ]
             if stale:
                 self._log("  [#e0b341]⚠ existing test(s) may be stale[/]: " + ", ".join(stale))
         self.notify(f"Changes since last discover — {d.summary()}", timeout=8)
@@ -1402,7 +1743,7 @@ class AitomationApp(App):
                 inv = await discover_crawl(
                     origin, provider, on_page=lambda p: self._log(f"crawled {escape(p.url)}")
                 )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self._log(f"[#f2647b]discovery failed[/] {escape(str(e))}")
             self.notify(f"Discovery failed: {type(e).__name__}: {e}", severity="error", timeout=8)
             return
@@ -1414,8 +1755,10 @@ class AitomationApp(App):
         rec = self.workspace.save(inv, origin=origin)
         self.recorder.app = inv.system_name
         self.recorder.flush()
-        self._log(f"[#56d39a]discovered[/] {inv.system_name} — {len(inv.elements)} elements, "
-                  f"{len(inv.suggested_journeys)} flows · next: scaffold ([b]s[/])")
+        self._log(
+            f"[#56d39a]discovered[/] {inv.system_name} — {len(inv.elements)} elements, "
+            f"{len(inv.suggested_journeys)} flows · next: scaffold ([b]s[/])"
+        )
         if baseline is not None:
             self._report_inventory_diff(baseline, inv, rec)
         self._refresh_systems(select=0)
@@ -1429,7 +1772,9 @@ class AitomationApp(App):
     async def run_tests(self) -> None:
         run = Path(self.current.latest_run)
         log = self.query_one("#log", RichLog)
-        self._log("[#22d3ee]running pytest[/] [dim](the test runner decides pass/fail — the AI never does)[/]")
+        self._log(
+            "[#22d3ee]running pytest[/] [dim](the test runner decides pass/fail — the AI never does)[/]"
+        )
         self._begin_progress(None, f"pytest in {run.name} …")
         env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
         captured: list[str] = []
@@ -1437,8 +1782,15 @@ class AitomationApp(App):
             proc = await asyncio.create_subprocess_exec(
                 # -rA: list EVERY test's outcome in the summary so the Tests tab can show
                 # per-file pass/fail from this run (not just stale file markers).
-                "uv", "run", "pytest", "-rA", "--tb=short", cwd=str(run), env=env,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                "uv",
+                "run",
+                "pytest",
+                "-rA",
+                "--tb=short",
+                cwd=str(run),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
             )
             assert proc.stdout is not None
             async for raw in proc.stdout:
@@ -1454,16 +1806,23 @@ class AitomationApp(App):
 
         # Persist the full output, and surface the reasons (not just an exit code).
         (run / "pytest-output.txt").write_text("\n".join(captured), encoding="utf-8")
-        summary_at = next((i for i, ln in enumerate(captured) if "short test summary info" in ln), None)
+        summary_at = next(
+            (i for i, ln in enumerate(captured) if "short test summary info" in ln), None
+        )
         tail = captured[summary_at:] if summary_at is not None else captured[-25:]
         counts = next(
-            (ln.strip("= ") for ln in reversed(captured)
-             if " in " in ln and any(w in ln for w in ("passed", "failed", "error"))),
+            (
+                ln.strip("= ")
+                for ln in reversed(captured)
+                if " in " in ln and any(w in ln for w in ("passed", "failed", "error"))
+            ),
             f"exit {rc}",
         )
         verdict = "[#56d39a]✓[/]" if rc == 0 else "[#f2647b]✗[/]"
         self._log(f"{verdict} pytest: {counts}  [dim](full output → {run}/pytest-output.txt)[/]")
-        self.notify(f"pytest: {counts}", severity="information" if rc == 0 else "warning", timeout=8)
+        self.notify(
+            f"pytest: {counts}", severity="information" if rc == 0 else "warning", timeout=8
+        )
         self._last_run_failed = rc != 0
         self.refresh_bindings()  # reveal/hide [f] in the footer
         # Reflect THIS run's per-test results in the Tests tab status column, and persist them
@@ -1472,7 +1831,8 @@ class AitomationApp(App):
         self._save_outcomes(run)
         self._render_tests()
         self.push_screen(
-            ResultsScreen(f"pytest — {counts}", "\n".join(tail), has_failures=rc != 0), self._on_results
+            ResultsScreen(f"pytest — {counts}", "\n".join(tail), has_failures=rc != 0),
+            self._on_results,
         )
 
     def _on_results(self, fix: bool | None) -> None:
@@ -1491,12 +1851,14 @@ class AitomationApp(App):
             if r.confidence == "existing":
                 self._log(f"[dim]kept {r.path.name} (already drafted)[/]")
             else:
-                self._log(f"drafted {r.path.name} — {'skip (destructive)' if r.destructive else 'ok'}")
+                self._log(
+                    f"drafted {r.path.name} — {'skip (destructive)' if r.destructive else 'ok'}"
+                )
 
         try:
             # Non-destructive: only new flows are drafted; existing tests are kept.
             report = await draft_tests(self.current_inv, self._llm, into=dest, on_draft=progress)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self._log(f"[#f2647b]write failed[/] {escape(str(e))}")
             self.notify(f"Write failed: {type(e).__name__}: {e}", severity="error", timeout=8)
             return
@@ -1513,16 +1875,22 @@ class AitomationApp(App):
     async def run_fix(self) -> None:
         inv, dest = self.current_inv, Path(self.current.latest_run)
         self.recorder.app = self.current.name
-        self._log("[#22d3ee]fixing[/] [dim]re-running each draft; self-healing the failures (one retry each)[/]")
+        self._log(
+            "[#22d3ee]fixing[/] [dim]re-running each draft; self-healing the failures (one retry each)[/]"
+        )
         self._begin_progress(None, "fixing failing tests …")
 
         def progress(r) -> None:
-            verb = "[#56d39a]fixed[/]" if r.fixed else f"[#f2647b]still failing[/] [dim]({r.reason})[/]"
+            verb = (
+                "[#56d39a]fixed[/]"
+                if r.fixed
+                else f"[#f2647b]still failing[/] [dim]({r.reason})[/]"
+            )
             self._log(f"{verb} {r.path.name}")
 
         try:
             report = await heal_failing_tests(inv, self._llm, into=dest, on_heal=progress)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self._log(f"[#f2647b]fix failed[/] {escape(str(e))}")
             self.notify(f"Fix failed: {type(e).__name__}: {e}", severity="error", timeout=8)
             return
@@ -1537,11 +1905,12 @@ class AitomationApp(App):
             self._log("[#56d39a]fix[/] nothing to fix — all drafts pass")
             self.notify("Nothing to fix — all drafts pass.")
         else:
-            verdict = "[#56d39a]✓[/]" if n_left == 0 else "[#e0b341]∼[/]"
+            verdict = "[#56d39a]✓[/]" if n_left == 0 else "[#e0b341]~[/]"
             self._log(f"{verdict} fix: [#56d39a]{n_fixed} fixed[/] · {n_left} still failing")
             self.notify(
                 f"Fixed {n_fixed}; {n_left} still failing.",
-                severity="information" if n_left == 0 else "warning", timeout=8,
+                severity="information" if n_left == 0 else "warning",
+                timeout=8,
             )
         # Reflect the heal results in the status column: just-fixed tests now read 'passed',
         # ones that still fail read 'failed' — overriding any stale RUNTIME FAILURE marker.
@@ -1554,5 +1923,7 @@ class AitomationApp(App):
         self.query_one("#tabs", TabbedContent).active = "tab-tests"
 
 
-def run(*, provider: str | None = None, model: str | None = None, usage_log: str = DEFAULT_LOG) -> None:
+def run(
+    *, provider: str | None = None, model: str | None = None, usage_log: str = DEFAULT_LOG
+) -> None:
     AitomationApp(provider_override=provider, model_override=model, usage_log=usage_log).run()
