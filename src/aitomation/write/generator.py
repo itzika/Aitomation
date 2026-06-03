@@ -143,21 +143,65 @@ _PUBLISH_MARKERS = (
 )
 
 
+def _executable_source(code: str) -> str:
+    """`code` reduced to executable statements — comments and module/class/function docstrings
+    removed — so prose ("rejects inserts", "delete the row") in a docstring or comment can't
+    trip the mutation markers below. Real DML/writes live in string args to execute()/produce()
+    and in method calls, which survive. Falls back to the raw text when the draft doesn't parse."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                node.body = body[1:] or [ast.Pass()]
+    try:
+        return ast.unparse(ast.fix_missing_locations(tree))
+    except Exception:
+        return code
+
+
 def _mutates_backend(code: str) -> bool:
     """True if a generated DATA/EVENT draft actually performs a write/publish (vs. read-only
     introspection or schema validation). The post-generation safety net behind is_destructive
     for backend surfaces — see _DML_MARKERS / _PUBLISH_MARKERS."""
-    lowered = code.lower()
+    lowered = _executable_source(code).lower()
     return any(m in lowered for m in _DML_MARKERS) or any(m in lowered for m in _PUBLISH_MARKERS)
 
 
+# HTTP write verbs in *generated code* — the post-generation net behind is_destructive for the
+# API surface. is_destructive only sees the elements a journey NAMED; if a draft issues a real
+# mutating request that wasn't one of them (e.g. an invented cleanup DELETE on a read-only
+# journey), this catches it from the code. DELETE/PUT/PATCH are unambiguous; POST is treated as
+# mutating here as it is everywhere else. Conservative by design — a false positive only
+# skip-guards a draft the reviewer can enable, while a miss could let a write run unguarded.
+_HTTP_WRITE_MARKERS = (".delete(", ".put(", ".patch(", ".post(")
+
+
+def _http_mutates(code: str) -> bool:
+    """True if generated API-test code issues an HTTP write (POST/PUT/PATCH/DELETE)."""
+    lowered = _executable_source(code).lower()
+    return any(m in lowered for m in _HTTP_WRITE_MARKERS)
+
+
 def is_destructive(inv: CoverageInventory, journey: Journey) -> bool:
-    """True if the journey performs a destructive action. API endpoints with a mutating
-    method always count. For web forms we flag only **password-bearing** forms or a mutating
-    form the journey **explicitly submits** — so an incidental footer/newsletter form on a
-    page doesn't flag every journey that merely visits it."""
-    by_name = {e.name: e for e in inv.elements}
-    referenced = [by_name[n] for n in journey.elements if n in by_name]
+    """True if the journey performs a destructive action. Judged over the SAME element set the
+    draft is grounded on (`_elements_for`), which falls back to the whole inventory when the
+    journey's `elements` came back empty — so a journey the LLM under-populated, or whose
+    references discovery's name-filter stripped, is assessed against the surface it will
+    actually be prompted with rather than silently treated as safe (the fail-safe that keeps a
+    generated DELETE from running unguarded). API endpoints with a mutating method always
+    count. For web forms we flag only **password-bearing** forms or a mutating form the journey
+    **explicitly submits** — so an incidental footer/newsletter form on a page doesn't flag
+    every journey that merely visits it."""
+    referenced = _elements_for(inv, journey)
 
     if any(
         e.kind == "endpoint" and (e.method or "").upper() in _MUTATING_METHODS for e in referenced
@@ -337,14 +381,38 @@ def _po_signature(e: TestableElement) -> str:
     return f"  {name}(page): .goto()"
 
 
-def build_prompt(inv: CoverageInventory, journey: Journey, *, destructive: bool = False) -> str:
+def build_prompt(
+    inv: CoverageInventory,
+    journey: Journey,
+    *,
+    destructive: bool = False,
+    surfaces: tuple[bool, bool, bool, bool] | None = None,
+) -> str:
     steps = "\n".join(f"  {i + 1}. {s.action}" for i, s in enumerate(journey.steps)) or "  (none)"
     elements = _elements_for(inv, journey)
-    # Declare the journey type so the static system prompt's conditional rules resolve.
-    web = any(e.kind in ("page", "form") for e in elements)
-    api = any(e.kind == "endpoint" for e in elements)
-    event = any(e.kind in ("topic", "event_schema") for e in elements)
-    data = any(e.kind in ("table", "migration") for e in elements)
+    # Declare the journey type so the static system prompt's conditional rules resolve. When the
+    # caller supplies `surfaces` (web, api, event, data) — the heal path, where the failing
+    # test's own code classifies it better than the whole inventory — honour those AND keep only
+    # matching-kind elements, so the element list, the per-surface hints, and the journey-type
+    # tag all agree (rather than the tag saying one thing and the lint checking another).
+    if surfaces is not None:
+        web, api, event, data = surfaces
+        kinds: set[str] = set()
+        if web:
+            kinds |= {"page", "form"}
+        if api:
+            kinds |= {"endpoint"}
+        if event:
+            kinds |= {"topic", "event_schema"}
+        if data:
+            kinds |= {"table", "migration"}
+        if kinds:
+            elements = [e for e in elements if e.kind in kinds]
+    else:
+        web = any(e.kind in ("page", "form") for e in elements)
+        api = any(e.kind == "endpoint" for e in elements)
+        event = any(e.kind in ("topic", "event_schema") for e in elements)
+        data = any(e.kind in ("table", "migration") for e in elements)
     jtype = journey_type(web=web, api=api, event=event, data=data)
     safety = ""
     if destructive:
@@ -589,6 +657,7 @@ def _corrective(findings: list[str]) -> str:
 def run_test_file(test_file_path: Path, cwd: Path) -> tuple[int, str]:
     """Runs a single test file using pytest and captures the output.
     Returns (exit_code, output)."""
+    import os
     import shutil
     import subprocess
 
@@ -597,6 +666,11 @@ def run_test_file(test_file_path: Path, cwd: Path) -> tuple[int, str]:
     if shutil.which("uv"):
         cmd = ["uv", "run", *cmd]
 
+    # Drop VIRTUAL_ENV so `uv run` resolves (and auto-syncs) the SCAFFOLD's own venv instead of
+    # inheriting whatever venv launched the toolkit — otherwise pytest runs without the
+    # scaffold's pytest-playwright/sqlalchemy and every draft errors at collection.
+    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+
     try:
         res = subprocess.run(
             cmd,
@@ -604,6 +678,7 @@ def run_test_file(test_file_path: Path, cwd: Path) -> tuple[int, str]:
             capture_output=True,
             text=True,
             timeout=30,  # 30 second timeout per test file
+            env=env,
         )
         return res.returncode, res.stdout + res.stderr
     except subprocess.TimeoutExpired as e:
@@ -630,6 +705,26 @@ def _runtime_failure_note(output: str, prior: str) -> str:
     return (
         "RUNTIME FAILURE (still failing after one self-heal). "
         f"Last pytest output: {trace}  ||  {prior}"
+    )
+
+
+# Unambiguously ENVIRONMENTAL failures — not a draft defect. `uv run` auto-syncs Python deps,
+# so the one prep step it can't do is install the browser binaries; a verify/heal run that hits
+# this must not burn a self-heal call on code that was never broken.
+_SETUP_FAILURE_SIGNALS = ("playwright install", "executable doesn't exist")
+
+
+def _is_setup_failure(output: str) -> bool:
+    """True if a failed run is environmental (browser not installed), not a draft bug."""
+    low = output.lower()
+    return any(s in low for s in _SETUP_FAILURE_SIGNALS)
+
+
+def _setup_failure_note(output: str, prior: str) -> str:
+    tail = " | ".join(line.strip() for line in output.splitlines()[-8:] if line.strip())
+    return (
+        "VERIFY INCOMPLETE — the scaffold isn't ready to run this (install browsers first: "
+        f"`uv run playwright install chromium`), then re-run. Last output: {tail}  ||  {prior}"
     )
 
 
@@ -692,9 +787,16 @@ async def _verify_and_heal(
     discarded in favour of the original (which already passed lint + compile), so self-heal
     can never cost us a runnable draft. If the test still fails after the retry, the runtime
     trace is folded into review_notes so the still-runnable draft isn't trusted blindly."""
-    rc, output = run_test_file(path, into)
+    rc, output = await asyncio.to_thread(run_test_file, path, into)
     if rc == 0:
         return draft, body, header, False
+    if _is_setup_failure(output):
+        # Environmental, not a draft defect (e.g. browsers not installed) — leave the draft
+        # runnable and tell the reviewer how to prepare the scaffold; don't spend a heal call.
+        draft.review_notes = _setup_failure_note(output, draft.review_notes)
+        header = _header(inv, journey, draft, destructive=False)
+        path.write_text(header + body, encoding="utf-8")
+        return draft, body, header, True
 
     retry, retry_body, retry_header, clean = await _regenerate_and_validate(
         inv,
@@ -715,7 +817,7 @@ async def _verify_and_heal(
     if clean:
         draft, body, header = retry, retry_body, retry_header
         path.write_text(header + body, encoding="utf-8")
-        rc, output = run_test_file(path, into)
+        rc, output = await asyncio.to_thread(run_test_file, path, into)
 
     if rc != 0:
         draft.review_notes = _runtime_failure_note(output, draft.review_notes)
@@ -823,6 +925,11 @@ async def draft_tests(
         # emitted real mutation (DML/commit or a broker publish), guard it like any
         # destructive flow. Judged from the generated CODE, not the journey prose.
         if not destructive and (event or data) and _mutates_backend(draft.code):
+            destructive = True
+        # API draft that issues an HTTP write not tied to a referenced mutating element (e.g.
+        # an invented cleanup DELETE on a read-only journey) — the inventory-level check only
+        # sees named elements, so guard it from the generated code as the backstop.
+        if not destructive and api and _http_mutates(draft.code):
             destructive = True
 
         # Inject the skip guard deterministically — never rely on the model to add it.
@@ -969,6 +1076,18 @@ async def heal_failing_tests(
         if rc == 0:
             report.passed.append(path)
             continue
+        if _is_setup_failure(output):
+            # Environmental (e.g. browsers not installed), not a draft bug — don't heal it.
+            result = HealResult(
+                path.stem,
+                path,
+                fixed=False,
+                reason="scaffold not ready — run `uv run playwright install chromium`",
+            )
+            report.still_failing.append(result)
+            if on_heal is not None:
+                on_heal(result)
+            continue
 
         # Match by stable flow fingerprint first (survives renames), then filename. If neither
         # resolves, ground the fix on the failing test itself — its code has the real paths.
@@ -995,7 +1114,10 @@ async def heal_failing_tests(
             inv,
             journey,
             provider,
-            prompt=build_prompt(inv, journey),
+            # Ground the prompt on the SAME surfaces the lint gates use — for an unmatched test
+            # those come from the test's own code (more accurate than the whole inventory), so
+            # the journey-type tag and the lint can't disagree.
+            prompt=build_prompt(inv, journey, surfaces=(web, api, event, data)),
             system_prompt=_SYSTEM_PROMPT,
             web=web,
             api=api,

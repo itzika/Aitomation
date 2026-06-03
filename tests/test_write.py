@@ -325,6 +325,76 @@ def test_is_destructive_flags_mutating_journeys():
     assert is_destructive(inv, crud) is True
 
 
+def test_is_destructive_empty_elements_fails_safe():
+    # The gap: a journey whose `elements` came back empty (LLM under-populated it, or
+    # discovery's name-filter stripped every reference) is grounded on the FULL surface — so it
+    # must be judged over that surface, not silently treated as safe. Over a mutating system it
+    # is destructive; over a read-only (GET-only) one it stays safe.
+    empty = Journey(
+        name="Ambiguous",
+        description="delete the pet via DELETE /pets/{id}",
+        priority="high",
+        steps=[JourneyStep(action="remove the pet")],
+        elements=[],
+    )
+    assert is_destructive(_mutating_inv(), empty) is True
+    read_only = Journey(name="x", description="d", priority="high", steps=[], elements=[])
+    assert is_destructive(_inv(), read_only) is False
+
+
+async def test_draft_guards_empty_element_journey_over_mutating_system(tmp_path):
+    # End-to-end: the empty-elements journey over a mutating system must be skip-guarded, not
+    # written runnable. (Without the fail-safe, is_destructive returned False and no guard was
+    # injected — a generated mutation could run.)
+    inv = _mutating_inv()
+    inv.suggested_journeys = [
+        Journey(
+            name="Ambiguous flow",
+            description="touches the API",
+            priority="high",
+            steps=[JourneyStep(action="do something")],
+            elements=[],
+        )
+    ]
+    report = await draft_tests(inv, _FakeProvider(), into=tmp_path)
+    assert len(report.written) == 1 and report.written[0].destructive is True
+    assert "pytestmark = pytest.mark.skip" in report.written[0].path.read_text()
+
+
+def test_http_mutates_flags_write_verbs_only():
+    from aitomation.write.generator import _http_mutates
+
+    assert _http_mutates("r = api_request_context.get('pets')\n    assert r.ok\n") is False
+    assert _http_mutates("api_request_context.delete(f'pets/{pid}')\n") is True
+    assert _http_mutates("api_request_context.post('pets', data={})\n") is True
+    assert _http_mutates("api_request_context.put('pets/1', data={})\n") is True
+
+
+async def test_draft_guards_invented_http_write_on_readonly_journey(tmp_path):
+    # A journey that references ONLY a GET element, but whose draft issues a DELETE (an invented
+    # cleanup). The inventory-level check sees only the GET; the code-level backstop must still
+    # guard the draft so the stray write can't run.
+    inv = _mutating_inv()
+    inv.suggested_journeys = [
+        Journey(
+            name="Read then clean",
+            description="list pets",
+            priority="high",
+            steps=[JourneyStep(action="list")],
+            elements=["list_pets"],
+        )
+    ]
+    sneaky = (
+        "def test_read(api_request_context):\n"
+        "    r = api_request_context.get('pets')\n"
+        "    assert r.ok\n"
+        "    api_request_context.delete('pets/1')  # invented cleanup\n"
+    )
+    report = await draft_tests(inv, _FakeProvider(code=sneaky), into=tmp_path)
+    assert len(report.written) == 1 and report.written[0].destructive is True
+    assert "pytestmark = pytest.mark.skip" in report.written[0].path.read_text()
+
+
 async def test_destructive_drafts_are_skipped_by_default(tmp_path):
     report = await draft_tests(_mutating_inv(), _FakeProvider(), into=tmp_path)
     by_journey = {r.journey: r for r in report.written}
@@ -708,6 +778,29 @@ def test_draft_tests_verify_discards_regressing_retry(tmp_path):
     compile(body, str(report.written[0].path), "exec")
 
 
+def test_draft_tests_verify_skips_heal_on_setup_failure(tmp_path):
+    import asyncio
+    from unittest.mock import MagicMock, patch
+
+    # A browser-not-installed failure is environmental, not a draft bug — verify must NOT spend
+    # a self-heal call on it; it leaves the draft runnable with an actionable note instead.
+    provider = _FakeProvider(code=_WEB_OK)
+    mock_run = MagicMock(
+        side_effect=[(1, "Executable doesn't exist ... run `playwright install chromium`")]
+    )
+
+    with patch("aitomation.write.generator.run_test_file", mock_run):
+        report = asyncio.run(
+            draft_tests(_web_inv(), provider, into=tmp_path, max_journeys=1, verify=True)
+        )
+
+    # only the initial generation; no corrective heal call, the test was run once
+    assert mock_run.call_count == 1 and len(provider.prompts) == 1
+    assert len(report.written) == 1 and report.written[0].runtime_failed is True
+    body = report.written[0].path.read_text()
+    assert "VERIFY INCOMPLETE" in body and "playwright install" in body
+
+
 # -- heal_failing_tests (the interactive "f" fix) ---------------------------------------
 
 
@@ -1026,6 +1119,32 @@ def test_mutates_backend_flags_real_writes_only():
     )
     # actual broker publish → mutation
     assert _mutates_backend("producer.produce('orders', value=b'x')") is True
+
+    # prose in a DOCSTRING or COMMENT must NOT false-positive — only executable code is scanned
+    assert (
+        _mutates_backend(
+            "def test_x(db_inspector):\n"
+            '    """Verify the table rejects bad inserts and an UPDATE without a WHERE."""\n'
+            "    # delete from is described, not performed\n"
+            "    assert 'users' in db_inspector.get_table_names()\n"
+        )
+        is False
+    )
+
+
+def test_http_mutates_ignores_prose_in_comments():
+    from aitomation.write.generator import _http_mutates
+
+    # a comment mentioning a write verb is not a real call
+    assert (
+        _http_mutates(
+            "def test_x(api_request_context):\n"
+            "    # could call api_request_context.delete(...) for cleanup, but we don't\n"
+            "    r = api_request_context.get('pets')\n"
+            "    assert r.ok\n"
+        )
+        is False
+    )
 
 
 def test_system_prompt_documents_event_and_data():
