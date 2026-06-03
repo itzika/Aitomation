@@ -8,8 +8,34 @@ from __future__ import annotations
 from typer.testing import CliRunner
 
 from aitomation.cli import app
+from aitomation.models import CoverageInventory, Journey
+from aitomation.models import TestableElement as Element
+from aitomation.workspace import Workspace
+from aitomation.write.generator import _SKIP_BLOCK
 
 runner = CliRunner()
+
+
+def _inventory_file(tmp_path, name="Rick & Morty API"):
+    inv = CoverageInventory(
+        system_name=name,
+        base_url="https://rickandmortyapi.com/api",
+        source="openapi",
+        elements=[
+            Element(
+                kind="endpoint",
+                name="list_chars",
+                location="/character",
+                method="GET",
+                description="List characters",
+                priority="high",
+            ),
+        ],
+        suggested_journeys=[Journey(name="Browse", description="d", priority="high")],
+    )
+    p = tmp_path / "inv.json"
+    p.write_text(inv.model_dump_json(indent=2), encoding="utf-8")
+    return p
 
 
 def test_cli_help_lists_all_commands():
@@ -71,3 +97,37 @@ def test_cli_try_load_inventory_reads_baseline(tmp_path):
     assert _try_load_inventory(p).system_name == "Demo"
     (tmp_path / "junk.json").write_text("not an inventory", encoding="utf-8")
     assert _try_load_inventory(tmp_path / "junk.json") is None
+
+
+def test_scaffold_default_routes_through_shared_workspace(tmp_path, monkeypatch):
+    # No --out → the CLI must use the same projects/<slug>/e2e/run-*/ layout the TUI uses,
+    # and register the system in the shared index so the TUI library lists it.
+    monkeypatch.chdir(tmp_path)
+    inv_path = _inventory_file(tmp_path)
+    result = runner.invoke(app, ["scaffold", str(inv_path)])
+    assert result.exit_code == 0, result.output
+
+    runs = list((tmp_path / "projects").glob("*/e2e/run-*"))
+    assert len(runs) == 1, "scaffold did not use the workspace run-dir layout"
+    assert (runs[0] / "conftest.py").is_file()
+
+    systems = Workspace("projects").list_systems()
+    assert len(systems) == 1 and systems[0].scaffolded is True
+    assert systems[0].latest_run and (tmp_path / systems[0].latest_run) == runs[0]
+
+
+def test_enable_resolves_workspace_run_dirs(tmp_path, monkeypatch):
+    # `enable -i projects` must reach drafts under projects/<slug>/e2e/run-*/tests via the
+    # shared Workspace — the layout the TUI writes — not just flat projects/<slug>/tests.
+    monkeypatch.chdir(tmp_path)
+    inv_path = _inventory_file(tmp_path)
+    assert runner.invoke(app, ["scaffold", str(inv_path)]).exit_code == 0
+    run = next((tmp_path / "projects").glob("*/e2e/run-*"))
+
+    guarded = _SKIP_BLOCK + "def test_delete():\n    assert True\n"
+    (run / "tests").mkdir(exist_ok=True)
+    (run / "tests" / "test_delete.py").write_text("# Flow: x\n\n" + guarded, encoding="utf-8")
+
+    result = runner.invoke(app, ["enable", "--all", "-i", "projects"])
+    assert result.exit_code == 0, result.output
+    assert _SKIP_BLOCK not in (run / "tests" / "test_delete.py").read_text(encoding="utf-8")

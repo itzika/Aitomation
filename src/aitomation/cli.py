@@ -28,6 +28,7 @@ from .naming import PROJECTS_ROOT, slugify
 from .providers import PydanticAIProvider
 from .scaffold import scaffold_project
 from .telemetry import DEFAULT_LOG, UsageRecorder, aggregate, load_records
+from .workspace import Workspace
 from .write import draft_tests, enable_drafts, find_skipped_drafts
 
 app = typer.Typer(
@@ -173,9 +174,14 @@ def _print_diff(d: InventoryDiff) -> None:
             "  [yellow]![/] existing flow(s) may be stale (re-draft with "
             "[bold]write --force[/]): " + ", ".join(j.name for j in d.affected_journeys)
         )
+    if d.removed_journeys:
+        console.print(
+            f"  [red]-[/] {len(d.removed_journeys)} flow(s) lost surface (now-removed "
+            "elements): " + ", ".join(j.name for j in d.removed_journeys)
+        )
 
 
-def _finish(coro, out: Path) -> None:
+def _finish(coro, out: Path, *, origin: str | None = None) -> None:
     """Await a discovery coroutine, then write + print the inventory (shared epilogue)."""
     baseline = _try_load_inventory(out)
     try:
@@ -193,6 +199,11 @@ def _finish(coro, out: Path) -> None:
         d = diff_inventories(baseline, inventory)
         if not d.is_empty:
             _print_diff(d)
+    # Mirror into the shared Workspace (same one the TUI browses) so the system shows up in
+    # the library and a later `scaffold`/`write` lands in its run dir. Non-destructive: keeps
+    # prior pipeline flags + the run holding any earlier scaffold/drafts.
+    if origin is not None:
+        Workspace(PROJECTS_ROOT).save(inventory, origin=origin)
     console.print(f"\n[green]✓[/] Inventory written to [bold]{out}[/]")
 
 
@@ -216,7 +227,7 @@ def discover_openapi_cmd(
     recorder = UsageRecorder(app=source, log_path=usage_log)
     llm = _resolve_provider(provider, model, recorder)
     try:
-        _finish(discover_openapi(source, llm), out)
+        _finish(discover_openapi(source, llm), out, origin=source)
     finally:
         _report_usage(recorder)
 
@@ -241,7 +252,7 @@ def discover_asyncapi_cmd(
     recorder = UsageRecorder(app=source, log_path=usage_log)
     llm = _resolve_provider(provider, model, recorder)
     try:
-        _finish(discover_asyncapi(source, llm), out)
+        _finish(discover_asyncapi(source, llm), out, origin=source)
     finally:
         _report_usage(recorder)
 
@@ -266,7 +277,7 @@ def discover_registry_cmd(
     recorder = UsageRecorder(app=source, log_path=usage_log)
     llm = _resolve_provider(provider, model, recorder)
     try:
-        _finish(discover_registry(source, llm), out)
+        _finish(discover_registry(source, llm), out, origin=source)
     finally:
         _report_usage(recorder)
 
@@ -293,7 +304,7 @@ def discover_db_cmd(
     recorder = UsageRecorder(app=source, log_path=usage_log)
     llm = _resolve_provider(provider, model, recorder)
     try:
-        _finish(discover_db(source, llm), out)
+        _finish(discover_db(source, llm), out, origin=source)
     finally:
         _report_usage(recorder)
 
@@ -322,7 +333,7 @@ def discover_crawl_cmd(
     recorder = UsageRecorder(app=url, log_path=usage_log)
     llm = _resolve_provider(provider, model, recorder)
     try:
-        _finish(discover_crawl(url, llm, max_pages=max_pages, max_depth=max_depth), out)
+        _finish(discover_crawl(url, llm, max_pages=max_pages, max_depth=max_depth), out, origin=url)
     finally:
         _report_usage(recorder)
 
@@ -361,8 +372,14 @@ def write(
         err.print(f"[bold red]Invalid inventory:[/] {type(e).__name__}: {e}")
         raise typer.Exit(code=1) from None
 
-    if into is None:
-        into = Path(PROJECTS_ROOT) / slugify(inv.system_name)
+    managed = into is None
+    if managed:
+        # Default → the system's scaffold run dir in the shared Workspace (same layout the TUI
+        # uses), so CLI and TUI draft into one set of artifacts. Prefer the latest run (where
+        # `scaffold` laid down a runnable framework); create one only if none exists yet.
+        ws = Workspace(PROJECTS_ROOT)
+        slug = slugify(inv.system_name)
+        into = ws.ensure_run(slug)
 
     if not (into / "conftest.py").exists():
         console.print(
@@ -382,6 +399,12 @@ def write(
         raise typer.Exit(code=1) from None
     finally:
         _report_usage(recorder)
+
+    if managed:
+        # Record the draft in the shared index so the TUI library reflects it and re-runs
+        # target this same run. Upsert keeps the prior discover's origin/flags intact.
+        ws.save(inv)
+        ws.set_flags(slug, drafted=True, latest_run=str(into))
 
     if report.written:
         n_destructive = sum(1 for r in report.written if r.destructive)
@@ -423,11 +446,20 @@ def write(
 
 
 def _scaffold_dirs(into: Path) -> list[Path]:
-    """Resolve `into` to scaffold dir(s). If `into` itself is a scaffold (has tests/), use it;
-    otherwise treat it as a container and return its immediate children that are scaffolds — so
-    `aitomation enable` with the default projects/ scans every generated system."""
+    """Resolve `into` to scaffold dir(s). If `into` itself is a scaffold (has tests/), use it.
+    Otherwise treat it as a shared Workspace root and return each system's latest run dir (the
+    projects/<slug>/e2e/run-*/ layout the TUI also writes), so `aitomation enable` with the
+    default projects/ reaches every generated system — CLI- or TUI-produced alike. Falls back
+    to immediate child scaffolds for a plain directory of flat scaffolds."""
     if (into / "tests").is_dir():
         return [into]
+    runs = [
+        Path(r.latest_run)
+        for r in Workspace(into).list_systems()
+        if r.latest_run and (Path(r.latest_run) / "tests").is_dir()
+    ]
+    if runs:
+        return runs
     if into.is_dir():
         return [d for d in sorted(into.iterdir()) if (d / "tests").is_dir()]
     return []
@@ -516,8 +548,15 @@ def scaffold(
         err.print(f"[bold red]Invalid inventory:[/] {type(e).__name__}: {e}")
         raise typer.Exit(code=1) from None
 
-    if out is None:
-        out = Path(PROJECTS_ROOT) / slugify(inv.system_name)
+    managed = out is None
+    if managed:
+        # Default → a run dir in the shared Workspace (same layout the TUI uses), so CLI and
+        # TUI scaffold into one set of artifacts. Reuse the latest run so re-scaffolding
+        # refreshes it in place (Copier overwrites framework files, keeps drafted tests/);
+        # create one only on first scaffold.
+        ws = Workspace(PROJECTS_ROOT)
+        slug = slugify(inv.system_name)
+        out = ws.ensure_run(slug)
 
     if out.exists() and any(out.iterdir()):
         console.print(f"[yellow]![/] {out} exists and is non-empty; files may be overwritten.")
@@ -528,6 +567,12 @@ def scaffold(
     except Exception as e:
         err.print(f"[bold red]Scaffold failed:[/] {type(e).__name__}: {e}")
         raise typer.Exit(code=1) from None
+
+    if managed:
+        # Record in the shared index so the TUI library lists this system and `write` targets
+        # this run. Upsert keeps any prior discover's origin/flags intact.
+        ws.save(inv)
+        ws.set_flags(slug, scaffolded=True, latest_run=str(out))
 
     files = sorted(p.relative_to(out).as_posix() for p in out.rglob("*") if p.is_file())
     console.print(f"\n[green]✓[/] Scaffolded {len(files)} files into [bold]{out}[/]:")
