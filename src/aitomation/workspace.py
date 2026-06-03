@@ -39,6 +39,9 @@ class SystemRecord:
     drafted: bool
     updated_at: str
     latest_run: str | None = None  # path to the most recent e2e run directory
+    # Active deployment profile (dev/stage/prod) — scopes which stored credentials and
+    # BASE_URL the test run uses. Defaults so records written before profiles still load.
+    profile: str = "dev"
 
     @property
     def stage_dots(self) -> str:
@@ -138,6 +141,8 @@ class Workspace:
             drafted=bool(prev["drafted"]) if drafted is None and prev else bool(drafted),
             updated_at=datetime.now(UTC).isoformat(),
             latest_run=prev.get("latest_run") if prev else None,
+            # Preserve the active profile across a re-discover (like latest_run/flags).
+            profile=prev.get("profile", "dev") if prev else "dev",
         )
         self._meta(slug).parent.mkdir(parents=True, exist_ok=True)
         payload = {"meta": asdict(record), "inventory": inv.model_dump(mode="json")}
@@ -190,6 +195,16 @@ class Workspace:
         meta["updated_at"] = datetime.now(UTC).isoformat()
         f.write_text(json.dumps(data, indent=2), encoding="utf-8")
         return SystemRecord(**meta)
+
+    def set_profile(self, slug: str, profile: str) -> SystemRecord:
+        """Set the active deployment profile (dev/stage/prod) for a system — which stored
+        credential set + BASE_URL its test runs use. Persisted in the index."""
+        f = self._meta(slug)
+        data = json.loads(f.read_text(encoding="utf-8"))
+        data["meta"]["profile"] = profile
+        data["meta"]["updated_at"] = datetime.now(UTC).isoformat()
+        f.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        return SystemRecord(**data["meta"])
 
     def delete(self, slug: str) -> None:
         d = self.app_dir(slug)

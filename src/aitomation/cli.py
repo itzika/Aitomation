@@ -17,6 +17,18 @@ from rich.table import Table
 
 from . import __version__
 from .config import ConfigError, LLMConfig
+from .credentials import (
+    DEFAULT_PROFILE,
+    PROFILES,
+    CredentialError,
+    clear_credential,
+    clear_profile,
+    credential_status,
+    get_store,
+    needs_credentials,
+    profile_fields,
+    set_credential,
+)
 from .diff import InventoryDiff, diff_inventories
 from .discover.asyncapi import discover_asyncapi
 from .discover.crawl import discover_crawl
@@ -29,7 +41,7 @@ from .providers import PydanticAIProvider
 from .scaffold import scaffold_project
 from .telemetry import DEFAULT_LOG, UsageRecorder, aggregate, load_records
 from .workspace import Workspace
-from .write import draft_tests, enable_drafts, find_skipped_drafts
+from .write import draft_login, draft_tests, enable_drafts, find_skipped_drafts
 
 app = typer.Typer(
     name="aitomation",
@@ -39,6 +51,11 @@ app = typer.Typer(
 )
 discover_app = typer.Typer(help="Discover the testable surface of a system.", no_args_is_help=True)
 app.add_typer(discover_app, name="discover")
+creds_app = typer.Typer(
+    help="Store the system-under-test credentials a test run injects (per dev/stage/prod profile).",
+    no_args_is_help=True,
+)
+app.add_typer(creds_app, name="creds")
 
 console = Console()
 err = Console(stderr=True)
@@ -390,15 +407,30 @@ def write(
     console.print(f"[dim]Drafting tests for[/] [bold]{inv.system_name}[/] [dim]→[/] {into}/tests")
     recorder = UsageRecorder(app=inv.system_name, log_path=usage_log)
     llm = _resolve_provider(provider, model, recorder)
+    login = None
     try:
         report = asyncio.run(
             draft_tests(inv, llm, into=into, max_journeys=max_journeys, verify=verify, force=force)
         )
+        # Session-auth scaffold → author login.py from the discovered form (no-op otherwise).
+        # Best-effort: a failure here never fails the write.
+        try:
+            login = asyncio.run(draft_login(inv, llm, into=into, force=force))
+        except Exception as e:
+            err.print(f"[yellow]![/] login.py authoring skipped: {type(e).__name__}: {e}")
     except Exception as e:
         err.print(f"[bold red]Write failed:[/] {type(e).__name__}: {e}")
         raise typer.Exit(code=1) from None
     finally:
         _report_usage(recorder)
+
+    if login is not None and login.authored:
+        console.print(
+            "\n[green]✓[/] Authored [bold]login.py[/] from the discovered sign-in form "
+            "[dim](review before trusting; creds come from AUTH_USER/AUTH_PASS).[/]"
+        )
+    elif login is not None and login.reason and login.reason != "already authored":
+        console.print(f"[yellow]![/] login.py kept as the scaffold stub [dim]({login.reason})[/].")
 
     if managed:
         # Record the draft in the shared index so the TUI library reflects it and re-runs
@@ -582,6 +614,124 @@ def scaffold(
         f"\nNext: [bold]cd {out} && uv sync && uv run playwright install chromium && "
         f"BASE_URL={inv.base_url} uv run pytest[/]"
     )
+
+
+def _open_store():
+    """The active secret store, or exit with an actionable message if none is reachable."""
+    try:
+        return get_store()
+    except CredentialError as e:
+        err.print(f"[bold red]Credential store unavailable:[/] {e}")
+        raise typer.Exit(code=1) from None
+
+
+def _resolve_system(system: str) -> tuple[str, CoverageInventory, str]:
+    """Find a discovered system by slug or name. Returns (slug, inventory, active_profile)."""
+    ws = Workspace(PROJECTS_ROOT)
+    target = slugify(system)
+    for r in ws.list_systems():
+        if r.slug in (system, target):
+            return r.slug, ws.load_inventory(r.slug), getattr(r, "profile", DEFAULT_PROFILE)
+    err.print(
+        f"[bold red]No system[/] matching {system!r} under {PROJECTS_ROOT}. "
+        "Run [bold]aitomation discover …[/] first."
+    )
+    raise typer.Exit(code=1)
+
+
+@creds_app.command("list")
+def creds_list(
+    system: str | None = typer.Argument(None, help="Slug or name; omit to list every system."),
+    profile: str | None = typer.Option(
+        None, "--profile", help="dev/stage/prod (default: the system's active one)."
+    ),
+) -> None:
+    """Show which credentials are stored for a system/profile (values are never shown)."""
+    ws = Workspace(PROJECTS_ROOT)
+    records = ws.list_systems()
+    if system:
+        target = slugify(system)
+        records = [r for r in records if r.slug in (system, target)]
+        if not records:
+            err.print(f"[bold red]No system[/] matching {system!r} under {PROJECTS_ROOT}.")
+            raise typer.Exit(code=1)
+    store = _open_store()
+    shown = 0
+    for r in records:
+        inv = ws.load_inventory(r.slug)
+        if not needs_credentials(inv):
+            continue
+        shown += 1
+        prof = profile or getattr(r, "profile", DEFAULT_PROFILE)
+        status = credential_status(r.slug, prof, inv, store=store)
+        console.print(
+            f"\n[bold]{r.name}[/] [dim]({r.slug})[/]  profile: [cyan]{prof}[/]  [dim]· {store.label}[/]"
+        )
+        for f in profile_fields(inv):
+            mark = "[green]●[/]" if status[f.env] else "[yellow]○[/]"
+            secret = " [dim](secret)[/]" if f.secret else ""
+            console.print(f"  {mark} [bold]{f.env}[/]  {f.label}{secret}")
+    if not shown:
+        console.print(f"[dim]No systems needing credentials under {PROJECTS_ROOT}.[/]")
+
+
+@creds_app.command("set")
+def creds_set(
+    system: str = typer.Argument(..., help="Slug or name of the discovered system."),
+    env: str = typer.Argument(
+        ..., help="Field to set, e.g. AUTH_TOKEN / AUTH_USER / AUTH_PASS / BASE_URL."
+    ),
+    profile: str | None = typer.Option(
+        None, "--profile", help="dev/stage/prod (default: the system's active one)."
+    ),
+    value: str | None = typer.Option(
+        None, "--value", help="The value (omit to be prompted — hidden for secrets)."
+    ),
+) -> None:
+    """Store one credential for a system/profile (prompted hidden when --value is omitted)."""
+    slug, inv, active = _resolve_system(system)
+    fields = {f.env: f for f in profile_fields(inv)}
+    if env not in fields:
+        err.print(f"[bold red]{env}[/] isn't a field for this system. Choose: {', '.join(fields)}.")
+        raise typer.Exit(code=1)
+    prof = profile or active
+    if prof not in PROFILES:
+        err.print(f"[bold red]Unknown profile[/] {prof!r}. Choose: {', '.join(PROFILES)}.")
+        raise typer.Exit(code=1)
+    if value is None:
+        import getpass
+
+        value = (
+            getpass.getpass(f"{env} ({prof}, hidden): ")
+            if fields[env].secret
+            else typer.prompt(f"{env} ({prof})")
+        )
+    store = _open_store()
+    set_credential(slug, prof, env, value, store=store)
+    console.print(f"[green]✓[/] stored [bold]{env}[/] for {slug} (profile {prof}) in {store.label}")
+
+
+@creds_app.command("clear")
+def creds_clear(
+    system: str = typer.Argument(..., help="Slug or name of the discovered system."),
+    env: str | None = typer.Argument(
+        None, help="Field to clear; omit (or --all) to clear the whole profile."
+    ),
+    profile: str | None = typer.Option(
+        None, "--profile", help="dev/stage/prod (default: the system's active one)."
+    ),
+    all_: bool = typer.Option(False, "--all", help="Clear every stored value for the profile."),
+) -> None:
+    """Delete stored credential(s) for a system/profile."""
+    slug, inv, active = _resolve_system(system)
+    prof = profile or active
+    store = _open_store()
+    if all_ or env is None:
+        n = clear_profile(slug, prof, inv, store=store)
+        console.print(f"[green]✓[/] cleared {n} value(s) for {slug} (profile {prof})")
+    else:
+        clear_credential(slug, prof, env, store=store)
+        console.print(f"[green]✓[/] cleared [bold]{env}[/] for {slug} (profile {prof})")
 
 
 def _print_inventory(inv: CoverageInventory) -> None:

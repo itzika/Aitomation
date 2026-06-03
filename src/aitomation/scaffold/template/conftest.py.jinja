@@ -49,6 +49,8 @@ def auth_headers() -> dict:
 {% elif auth_kind == "session" %}
 from pathlib import Path
 
+from login import perform_login
+
 _STORAGE_STATE = Path(".auth/state.json")
 
 
@@ -61,18 +63,15 @@ def auth_headers() -> dict:
 def storage_state(browser) -> str:
     """Log in ONCE per session, persist the browser storage state, and reuse it across all
     tests — the Playwright best-practice (no per-test logins). Delete .auth/ to force a
-    fresh login."""
+    fresh login. The login steps live in login.py (perform_login), seeded from the discovered
+    form and authored by `aitomation write`; credentials come from AUTH_USER / AUTH_PASS in
+    the environment (the toolkit injects them per profile, or set them yourself)."""
     _STORAGE_STATE.parent.mkdir(parents=True, exist_ok=True)
     if _STORAGE_STATE.exists():
         return str(_STORAGE_STATE)
     context = browser.new_context()
     page = context.new_page()
-    page.goto(BASE_URL)
-    # TODO: perform the discovered login flow, e.g.
-    # page.get_by_label("Username").fill(os.environ["AUTH_USER"])
-    # page.get_by_label("Password").fill(os.environ["AUTH_PASS"])
-    # page.get_by_role("button", name="Sign in").click()
-    # page.wait_for_url("**/*")  # wait for the post-login navigation
+    perform_login(page, BASE_URL)
     context.storage_state(path=str(_STORAGE_STATE))
     context.close()
     return str(_STORAGE_STATE)
