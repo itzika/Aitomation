@@ -4,6 +4,31 @@ version = "0.1.0"
 description = "Discovery Toolkit — compresses the cold-start of test automation."
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "itzika", email = "17925237+itzika@users.noreply.github.com" }]
+keywords = [
+    "test-automation",
+    "playwright",
+    "pytest",
+    "openapi",
+    "test-discovery",
+    "scaffolding",
+    "llm",
+    "ai",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Software Development :: Code Generators",
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
 dependencies = [
     "copier>=9.15.1",
     # Per-system credential store for the system under test: keyring backs the OS keychain;
@@ -27,6 +52,11 @@ dependencies = [
 
 [project.scripts]
 aitomation = "aitomation.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/itzika/Aitomation"
+Repository = "https://github.com/itzika/Aitomation"
+Issues = "https://github.com/itzika/Aitomation/issues"
 
 [dependency-groups]
 dev = [
