@@ -45,3 +45,5 @@ usage.jsonl
 
 # Secrets
 .env
+
+/CLAUDE.md
