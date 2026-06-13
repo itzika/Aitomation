@@ -4,7 +4,11 @@ Point it at a system — it maps what's testable, scaffolds a Playwright + pytes
 
 Works with OpenAPI specs, AsyncAPI, databases, and live web apps. Bring your own API key. Model-agnostic.
 
-![Aitomation Workbench](docs/img/overview.png)
+<!-- ![Aitomation Workbench](docs/img/overview.png) -->
+
+<p align="center">
+  <img src="docs/img/overview.png" alt="The Aitomation Workbench — systems library, system Overview, live log" width="900">
+</p>
 
 ---
 
