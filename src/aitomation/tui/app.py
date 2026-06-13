@@ -12,7 +12,6 @@ import asyncio
 import contextlib
 import json
 import os
-import random
 import re
 import shutil
 import subprocess
@@ -82,11 +81,11 @@ from ..write import draft_login, draft_tests, enable_drafts, heal_failing_tests,
 # Restrained dark: ONE cyan accent on cool neutral darks. The old neon triad (cyan + magenta +
 # green) is gone — magenta retired to a muted slate, the accent unified to cyan, and the loud
 # green/yellow/red semantics desaturated so only genuine signals (errors, the accent) draw the
-# eye. The animated header banner stays the single bold flourish; the panel borders are a quiet
-# neutral (a literal in CSS, since custom theme vars aren't available when App.CSS is parsed).
+# eye. The panel borders are a quiet neutral (a literal in CSS, since custom theme vars
+# aren't available when App.CSS is parsed).
 CYBERPUNK = Theme(
     name="cyberpunk",
-    primary="#22d3ee",  # cyan — the single accent (focus, modal borders, matches the banner)
+    primary="#22d3ee",  # cyan — the single accent (focus, modal borders, header)
     secondary="#5b6b7f",  # muted slate (was magenta)
     accent="#22d3ee",  # keep the accent in the cyan family (was neon green)
     foreground="#cde7f0",
@@ -124,7 +123,6 @@ A system moves through three stages, shown as dots in the library: \
   m   change the provider/model — apply to the default or one stage (discover/write/fix)
   d   delete the selected system
   l   toggle the live log
-  b   fold / unfold the animated header banner
   ↑/↓ move · enter open · tab switch panes
   Ctrl+P   command palette
   ?   this help · q quit
@@ -170,6 +168,14 @@ _OUTCOME_LINE = re.compile(r"^(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)\s+(\S+?\
 
 def _status_text(status: str) -> Text:
     return Text(status, style=_STATUS_STYLE.get(status, ""))
+
+
+# Priority is the one scan-by-colour column outside run statuses: high pops, low recedes.
+_PRIORITY_STYLE = {"high": "#f2647b", "medium": "#e0b341", "low": "#5b6b7f"}
+
+
+def _priority_text(priority: str) -> Text:
+    return Text(priority, style=_PRIORITY_STYLE.get(priority, ""))
 
 
 def _parse_pytest_outcomes(lines: list[str]) -> dict[str, str]:
@@ -344,182 +350,35 @@ def _resolve_editor(
     return [cmd] if cmd else None
 
 
-# Title shimmer: a single-hue (dim cyan -> white) comet head with a short fading tail that
-# sweeps across the letters, with a beat between sweeps. Single-hue on purpose, so it reads as
-# light gliding over chrome rather than adding to a colour clash.
-_SHIMMER_TIERS = ("#155e6b", "#22d3ee", "#7eecff", "#ffffff")  # base, tail, mid, comet head
-_SHIMMER_GAP = 8  # cells of "pause" appended to the sweep so it pulses instead of running solid
-
-# Matrix-rain backdrop for the header band: ASCII glyphs falling in per-column streaks, each a
-# bright white head trailing a cyan tail that fades to near-black. Same cyan→white family as the
-# title shimmer so the band reads as one effect, not a palette pile-up.
-_RAIN_GLYPHS = "01<>[]{}/\\=+*#$%&!?:;~^|0123456789ABCDEF"
-_RAIN_HEAD = "#eafcff"
-_RAIN_FADE = ("#7eecff", "#22d3ee", "#1a8aa0", "#125663")
-_BAND_HEIGHT = 7
-
-
-def _shimmer_style(offset: int) -> str:
-    """Style for a title char `offset` cells behind the sweeping comet head."""
-    if offset == 0:
-        return f"bold {_SHIMMER_TIERS[3]}"
-    if offset == 1:
-        return _SHIMMER_TIERS[2]
-    if offset == 2:
-        return _SHIMMER_TIERS[1]
-    return _SHIMMER_TIERS[0]
-
-
-def _rain_style(d: int, length: int) -> str:
-    """Style for a rain cell `d` cells above its column's head, in a streak of `length`."""
-    if d == 0:
-        return f"bold {_RAIN_HEAD}"
-    f = d / max(length, 1)
-    if f < 0.2:
-        return _RAIN_FADE[0]
-    if f < 0.45:
-        return _RAIN_FADE[1]
-    if f < 0.75:
-        return _RAIN_FADE[2]
-    return _RAIN_FADE[3]
-
-
-class MatrixBanner(Static):
-    """The header: a matrix-rain ASCII animation across the full width with the 'aitomation'
-    title (shimmering) and the active model overlaid and centred. Clicking the title opens the
-    model picker (same as `m`). Collapsible to a single line (press `b`) and PAUSED while an
-    operation runs, so it's a flourish rather than a persistent, distracting backdrop."""
+class WorkbenchHeader(Static):
+    """A one-line header: the app title + the active provider:model, centred. Clicking it
+    opens the model picker — the same affordance as `m`. Deliberately minimal chrome (the
+    old animated banner is gone): one row, no icon, no surprises."""
 
     DEFAULT_CSS = """
-    MatrixBanner {
-        dock: top;
-        width: 100%;
-        height: 7;
-        background: $background;
-        color: $foreground;
-    }
-    MatrixBanner.-folded { height: 1; }
+    WorkbenchHeader { dock: top; width: 100%; height: 1; background: $panel; }
+    WorkbenchHeader:hover { background: $foreground 10%; }
     """
 
-    def __init__(self, *, id: str | None = None) -> None:
-        super().__init__(id=id)
-        self._expanded = True
-        self._paused = False
-        self._phase = 0  # shimmer comet position
-        self._w = self._h = 0  # last grid size; a change triggers a rebuild (handles resize)
-        self._heads: list[float] = []  # per-column streak head row (fractional for varied speed)
-        self._lens: list[int] = []
-        self._speeds: list[float] = []
-        self._buf: list[list[str]] = []  # the glyph each cell currently shows
-        self._title_row = 0
-
     def on_mount(self) -> None:
-        self.tooltip = "Click the title to change the model · press b to fold the banner"
-        self.set_interval(1 / 15, self._tick)  # ~15fps; negligible cost, paused during ops
+        self.tooltip = "Click to change the model (m)"
+        # The model lives in app.sub_title; re-render when either reactive changes so a
+        # provider/model switch shows up immediately.
+        self.watch(self.app, "title", lambda *_: self.refresh())
+        self.watch(self.app, "sub_title", lambda *_: self.refresh())
 
-    # -- animation state ----------------------------------------------------------------
-
-    def _ensure(self, w: int, h: int) -> None:
-        if w == self._w and h == self._h:
-            return
-        self._w, self._h = w, h
-        self._heads = [random.uniform(-h, 0) for _ in range(w)]
-        self._lens = [random.randint(3, max(h, 3)) for _ in range(w)]
-        self._speeds = [random.uniform(0.25, 0.7) for _ in range(w)]
-        self._buf = [[" "] * w for _ in range(h)]
-
-    def _tick(self) -> None:
-        if self._paused:
-            return
-        title = self.app.title or ""
-        self._phase = (self._phase + 1) % max(len(title) + _SHIMMER_GAP, 1)
-        if self._expanded:
-            w, h = self.size.width, self.size.height
-            if w > 0 and h > 1:
-                self._ensure(w, h)
-                for c in range(w):
-                    prev = int(self._heads[c])
-                    self._heads[c] += self._speeds[c]
-                    cur = int(self._heads[c])
-                    for rr in range(prev + 1, cur + 1):  # the head writes a new glyph as it falls
-                        if 0 <= rr < h:
-                            self._buf[rr][c] = random.choice(_RAIN_GLYPHS)
-                    if cur - self._lens[c] > h:  # streak fully off the bottom -> respawn at top
-                        self._heads[c] = random.uniform(-h, -1.0)
-                        self._lens[c] = random.randint(3, max(h, 3))
-                        self._speeds[c] = random.uniform(0.25, 0.7)
-        self.refresh()
-
-    def pause(self, paused: bool) -> None:
-        """Freeze/resume the animation — called around long operations so the rain doesn't
-        churn (and steal attention) while real work is happening."""
-        self._paused = paused
-
-    def toggle(self) -> None:
-        self._expanded = not self._expanded
-        self.set_class(not self._expanded, "-folded")
-        self.refresh()
-
-    # -- rendering ----------------------------------------------------------------------
-
-    def _compact(self, w: int) -> Text:
-        """Folded view: just the shimmering title + model on one centred line (no rain)."""
+    def render(self) -> Text:
         title, sub = self.app.title or "", self.app.sub_title or ""
         line = Text(no_wrap=True)
-        for i, ch in enumerate(title):
-            line.append(ch, style=_shimmer_style(self._phase - i))
+        line.append(title, style="bold #22d3ee")
         if sub:
             line.append("   ")
             line.append(sub, style="dim #7a8a99")
-        out = Text(" " * max(0, (w - line.cell_len) // 2))
+        out = Text(" " * max(0, (self.size.width - line.cell_len) // 2))
         out.append_text(line)
         return out
 
-    def render(self) -> Text:
-        w, h = self.size.width, self.size.height
-        if w <= 0 or h <= 0:
-            return Text("")
-        if not self._expanded or h <= 1:
-            return self._compact(w)
-        self._ensure(w, h)
-
-        chars = [[" "] * w for _ in range(h)]
-        styles: list[list[str]] = [[""] * w for _ in range(h)]
-        for c in range(w):
-            head = int(self._heads[c])
-            for r in range(h):
-                d = head - r
-                if 0 <= d < self._lens[c]:
-                    g = self._buf[r][c]
-                    chars[r][c] = g if g != " " else random.choice(_RAIN_GLYPHS)
-                    styles[r][c] = _rain_style(d, self._lens[c])
-
-        # Overlay the title (shimmering) and model, centred — these cells override the rain so
-        # they stay readable.
-        self._title_row = h // 2
-        title, sub = self.app.title or "", self.app.sub_title or ""
-        ts = max(0, (w - len(title)) // 2)
-        for i, ch in enumerate(title):
-            if ts + i < w:
-                chars[self._title_row][ts + i] = ch
-                styles[self._title_row][ts + i] = _shimmer_style(self._phase - i)
-        if sub and self._title_row + 1 < h:
-            ms = max(0, (w - len(sub)) // 2)
-            for i, ch in enumerate(sub):
-                if ms + i < w:
-                    chars[self._title_row + 1][ms + i] = ch
-                    styles[self._title_row + 1][ms + i] = "bold #cdd9e0"
-
-        text = Text(no_wrap=True)
-        for r in range(h):
-            for c in range(w):
-                text.append(chars[r][c], style=styles[r][c] or None)
-            if r < h - 1:
-                text.append("\n")
-        return text
-
     def on_click(self) -> None:
-        # Clicking the header opens the model picker — same metaphor as the old title bar.
         self.app.action_choose_model()
 
 
@@ -527,7 +386,7 @@ class UsageMeters(Static):
     """The Usage-tab summary: hero token + ~cost totals, the model(s) used as chips, in/out
     and per-stage meters, and a per-run cost sparkline. On mount the meters ease 0→value and
     the totals count up once, then settle — motion on a discrete event (selecting a system),
-    like the header band that pauses during work, never a perpetual backdrop."""
+    never a perpetual backdrop."""
 
     DEFAULT_CSS = """
     UsageMeters { height: auto; padding: 1 2 0 2; }
@@ -1099,7 +958,6 @@ class AitomationApp(App):
     .usage-run > CollapsibleTitle:hover { color: #22d3ee; background: $foreground 8%; }
     .usage-run-body { padding: 0 1 1 2; color: #9fb0c0; }
     .detail { height: auto; max-height: 14; padding: 1; border-top: solid #243240; }
-    HeaderTitle:hover { background: $foreground 10%; }
     #wizard { width: 64; height: auto; padding: 1 2; background: $surface; border: round $primary; }
     #wizard-title { color: $accent; text-style: bold; width: 100%; content-align: center middle; padding-bottom: 1; }
     #model-picker { width: 60; height: auto; max-height: 95%; padding: 1 2; background: $surface; border: round $primary; }
@@ -1142,7 +1000,6 @@ class AitomationApp(App):
         Binding("o", "open_editor", "Open"),
         Binding("d", "delete", "Delete"),
         Binding("l", "toggle_log", "Log"),
-        Binding("b", "toggle_banner", "Banner"),
         Binding("m", "choose_model", "Model"),
         Binding("question_mark", "help", "Help"),
         Binding("q", "quit", "Quit"),
@@ -1192,7 +1049,7 @@ class AitomationApp(App):
     # -- layout -------------------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        yield MatrixBanner(id="banner")
+        yield WorkbenchHeader()
         with Horizontal(id="main"):
             systems = DataTable(id="systems", cursor_type="row")
             systems.border_title = "systems"
@@ -1348,16 +1205,10 @@ class AitomationApp(App):
         if status:
             self.query_one("#status", Static).update(msg)
 
-    def _set_banner_paused(self, paused: bool) -> None:
-        # Freeze the header animation around long operations; tolerate the banner being absent.
-        with contextlib.suppress(Exception):
-            self.query_one(MatrixBanner).pause(paused)
-
     def _begin_progress(self, total: int | None, label: str) -> None:
         bar = self.query_one("#progress", ProgressBar)
         bar.display = True
         bar.update(total=total, progress=0)
-        self._set_banner_paused(True)
         self._log(label)
 
     def _advance_progress(self, n: int = 1) -> None:
@@ -1365,20 +1216,40 @@ class AitomationApp(App):
 
     def _end_progress(self, label: str = "") -> None:
         self.query_one("#progress", ProgressBar).display = False
-        self._set_banner_paused(False)
         if label:
             self._log(label)
 
     def action_toggle_log(self) -> None:
         self.query_one("#log", RichLog).toggle_class("-hidden")
 
-    def action_toggle_banner(self) -> None:
-        self.query_one(MatrixBanner).toggle()
-
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
 
+    # Actions that operate on a selected system / on a scaffolded run. check_action hides
+    # them from the footer (and blocks the key) while they can't apply, so the footer reads
+    # as "what you can do right now" instead of a full keymap (that's `?`).
+    _NEEDS_SYSTEM = frozenset(
+        {
+            "scaffold",
+            "write",
+            "rediscover",
+            "run_tests",
+            "fix_failing",
+            "enable_test",
+            "credentials",
+            "open_editor",
+            "delete",
+        }
+    )
+    _NEEDS_SCAFFOLD = frozenset({"write", "run_tests", "open_editor"})
+
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action in self._NEEDS_SYSTEM and self.current is None:
+            return None  # no system selected — only n / l / m / ? / q apply
+        if action in self._NEEDS_SCAFFOLD and not (
+            self.current and self.current.scaffolded and self.current.latest_run
+        ):
+            return None  # nothing runnable yet — scaffold (s) comes first
         # Hide [f] until a run has actually failed — fix only makes sense on failures.
         if action == "fix_failing":
             return self._last_run_failed
@@ -1416,6 +1287,7 @@ class AitomationApp(App):
             self.current = None
             self.current_inv = None
             self._render_overview_empty()
+            self.refresh_bindings()  # footer shrinks to the actions that still apply
             return
         if select is not None:
             row = min(select, len(self._records) - 1)
@@ -1444,6 +1316,7 @@ class AitomationApp(App):
         run = self.current.latest_run
         self._test_outcomes = self._load_outcomes(Path(run)) if run else {}
         self._populate_tabs()
+        self.refresh_bindings()  # footer tracks what applies to THIS system's pipeline state
 
     def _load_outcomes(self, run: Path) -> dict[str, str]:
         """The latest run's per-file pass/fail, read back from disk so the Tests-tab status
@@ -1641,7 +1514,7 @@ class AitomationApp(App):
         self._elements = list(self.current_inv.elements)
         for e in self._elements:
             loc = f"{e.method + ' ' if e.method else ''}{e.location}"
-            table.add_row(e.kind, e.name, loc, e.priority)
+            table.add_row(e.kind, e.name, loc, _priority_text(e.priority))
         self.query_one("#surface-detail", Static).update("")
 
     def _show_element(self, idx: int) -> None:
@@ -1668,7 +1541,7 @@ class AitomationApp(App):
         self._journeys = list(self.current_inv.suggested_journeys)
         for j in self._journeys:
             touches = ", ".join(j.elements[:3]) + ("…" if len(j.elements) > 3 else "")
-            table.add_row(j.priority, j.name, str(len(j.steps)), touches or "—")
+            table.add_row(_priority_text(j.priority), j.name, str(len(j.steps)), touches or "—")
         self.query_one("#journeys-detail", Static).update("")
 
     def _show_journey(self, idx: int) -> None:
@@ -1694,7 +1567,8 @@ class AitomationApp(App):
         out: list[tuple[str, str, Path]] = []
         tests_dir = run / "tests"
         if tests_dir.is_dir():
-            for p in sorted(tests_dir.glob("test_*.py")):
+            # Recursive: the package-layout scaffold routes drafts into tests/web|api|contract.
+            for p in sorted(tests_dir.rglob("test_*.py")):
                 text = p.read_text(encoding="utf-8")
                 outcome = self._test_outcomes.get(p.name)
                 if "mark.skip" in text and "DESTRUCTIVE" in text:
@@ -1713,7 +1587,7 @@ class AitomationApp(App):
                     status = "failing · see notes"
                 else:
                     status = "ok"
-                out.append((p.name, status, p))
+                out.append((p.relative_to(tests_dir).as_posix(), status, p))
         review = run / "drafts_needs_review"
         if review.is_dir():
             for p in sorted(review.glob("*.py.txt")):
@@ -2177,7 +2051,11 @@ class AitomationApp(App):
                 inv = await discover_db(origin, provider)
             else:  # crawl
                 inv = await discover_crawl(
-                    origin, provider, on_page=lambda p: self._log(f"crawled {escape(p.url)}")
+                    origin,
+                    provider,
+                    on_page=lambda p: self._log(f"crawled {escape(p.url)}"),
+                    # First-run self-heal: the browser download is announced, not a silent hang.
+                    on_status=lambda m: self._log(f"[#e0b341]{escape(m)}[/]"),
                 )
         except Exception as e:
             self._log(f"[#f2647b]discovery failed[/] {escape(str(e))}")

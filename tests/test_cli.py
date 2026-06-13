@@ -53,8 +53,88 @@ def test_cli_help_lists_all_commands():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     out = _plain(result)
-    for command in ("discover", "scaffold", "write", "usage", "tui", "version"):
+    for command in ("discover", "go", "scaffold", "write", "schema", "usage", "tui", "version"):
         assert command in out
+    # workflow order, not definition order: the help reads as the pipeline
+    assert out.index("tui") < out.index("go ") < out.index("scaffold") < out.index("version")
+
+
+def test_schema_command_prints_versioned_json_schema():
+    import json
+
+    result = runner.invoke(app, ["schema"])
+    assert result.exit_code == 0
+    schema = json.loads(result.output)
+    assert schema["properties"]["schema_version"]["default"] == 1
+
+
+def test_sniff_kind_detects_sources(tmp_path):
+    from aitomation.cli import _sniff_kind
+
+    assert _sniff_kind("postgresql://u@h/db") == "db"
+    assert _sniff_kind("./migrations/schema.sql") == "db"
+    spec = tmp_path / "spec.json"
+    spec.write_text('{"openapi": "3.0.3"}', encoding="utf-8")
+    assert _sniff_kind(str(spec)) == "openapi"
+    aspec = tmp_path / "events.yaml"
+    aspec.write_text("asyncapi: 3.0.0\n", encoding="utf-8")
+    assert _sniff_kind(str(aspec)) == "asyncapi"
+
+
+class _GoFakeProvider:
+    """Stands in for the LLM across the whole `go` pipeline: discovery judgement + drafts."""
+
+    async def generate(self, prompt, *, system=None, label=""):  # pragma: no cover
+        return ""
+
+    async def generate_structured(self, prompt, schema, *, system=None, label=""):
+        if schema.__name__ == "InventoryJudgment":
+            return schema(
+                system_summary="Petstore.",
+                auth_strategy="bearer",
+                high_priority=[],
+                low_priority=[],
+                suggested_journeys=[
+                    {
+                        "name": "Browse pets",
+                        "description": "list pets",
+                        "priority": "high",
+                        "steps": [],
+                        "elements": ["listPets"],
+                    }
+                ],
+            )
+        if schema.__name__ == "TestDraft":
+            return schema(
+                code="def test_ok(api_request_context):\n    assert True\n",
+                confidence="high",
+                review_notes="",
+            )
+        raise AssertionError(f"unexpected schema {schema.__name__}")
+
+
+def test_go_runs_full_pipeline(tmp_path, monkeypatch):
+    """One command: discover (stubbed model) → scaffold → drafts, all in the shared
+    workspace, with pipeline flags set so the TUI lists the system as fully processed."""
+    import pathlib
+
+    spec = pathlib.Path(__file__).parent.parent / "examples" / "petstore-mini.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("aitomation.cli._resolve_provider", lambda *a, **k: _GoFakeProvider())
+
+    result = runner.invoke(app, ["go", str(spec)])
+    assert result.exit_code == 0, result.output
+
+    runs = list((tmp_path / "projects").glob("*/e2e/run-*"))
+    assert len(runs) == 1
+    assert (runs[0] / "conftest.py").is_file()
+    assert (runs[0] / "api" / "client.py").is_file()  # package-layout scaffold
+    drafted = list((runs[0] / "tests").rglob("test_*.py"))
+    assert any(p.parent.name == "api" for p in drafted)  # draft routed by surface
+
+    systems = Workspace("projects").list_systems()
+    assert len(systems) == 1
+    assert systems[0].scaffolded is True and systems[0].drafted is True
 
 
 def test_cli_version():

@@ -185,9 +185,16 @@ async def test_fix_action_gated_until_a_run_fails(tmp_path):
     app = _app(tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
-        # [f] is hidden until a run has actually failed; other actions stay enabled
-        assert app.check_action("fix_failing", ()) is False
+        # contextual footer: run/write/open hidden until the system is scaffolded; the
+        # always-applicable actions stay
+        assert app.check_action("run_tests", ()) is None
+        assert app.check_action("write", ()) is None
+        assert app.check_action("scaffold", ()) is True
+        app.action_scaffold()
+        await pilot.pause(0.2)
         assert app.check_action("run_tests", ()) is True
+        # [f] is hidden until a run has actually failed
+        assert app.check_action("fix_failing", ()) is False
         # no failing run yet -> graceful no-op (warns), no crash, no state change
         app.action_fix_failing()
         await pilot.pause()
@@ -195,6 +202,16 @@ async def test_fix_action_gated_until_a_run_fails(tmp_path):
         # once a run fails, the affordance becomes available
         app._last_run_failed = True
         assert app.check_action("fix_failing", ()) is True
+
+
+async def test_footer_actions_hidden_with_no_system(tmp_path):
+    app = _app(tmp_path)  # empty workspace — nothing discovered yet
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        for action in ("scaffold", "write", "rediscover", "run_tests", "delete", "open_editor"):
+            assert app.check_action(action, ()) is None
+        for action in ("new_system", "choose_model", "toggle_log", "help"):
+            assert app.check_action(action, ()) is True
 
 
 async def test_fix_runs_heal_and_clears_flag(tmp_path):
@@ -440,8 +457,8 @@ async def test_model_picker_opens_and_closes(tmp_path, monkeypatch):
         assert not isinstance(app.screen, ModelScreen)
 
 
-async def test_clicking_title_bar_opens_model_picker(tmp_path, monkeypatch):
-    from aitomation.tui.app import MatrixBanner
+async def test_clicking_header_opens_model_picker(tmp_path, monkeypatch):
+    from aitomation.tui.app import WorkbenchHeader
 
     for var in _LLM_ENV:
         monkeypatch.delenv(var, raising=False)
@@ -449,7 +466,7 @@ async def test_clicking_title_bar_opens_model_picker(tmp_path, monkeypatch):
     app = _app(tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
-        await pilot.click(MatrixBanner)  # centre of the band == the title row -> model picker
+        await pilot.click(WorkbenchHeader)  # anywhere on the header row -> model picker
         await pilot.pause()
         assert isinstance(app.screen, ModelScreen)
 
@@ -726,37 +743,17 @@ async def test_tui_dispatches_new_discovery_sources(tmp_path):
         ] == "y.sql"
 
 
-async def test_header_banner_animates_folds_and_pauses(tmp_path):
-    # Cosmetic header band: renders the title over a matrix-rain backdrop, animates on tick,
-    # folds to one line (b), and freezes while an operation runs.
-    from aitomation.tui.app import MatrixBanner
+async def test_header_is_single_line_with_title(tmp_path):
+    # The old animated matrix-rain band is gone: the header is the standard one-line
+    # Textual Header showing the app title (and the model as sub-title).
+    from aitomation.tui.app import WorkbenchHeader
 
     app = _app(tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
-        banner = app.query_one(MatrixBanner)
-
-        # the title is rendered (over the rain) and the animation advances on tick
-        assert "aitomation" in banner.render().plain.lower()
-        before = banner._phase
-        banner._tick()
-        assert banner._phase != before
-
-        # fold/unfold via the binding flips expanded + the -folded class
-        assert banner._expanded is True
-        await pilot.press("b")
-        assert banner._expanded is False and banner.has_class("-folded")
-        await pilot.press("b")
-        assert banner._expanded is True and not banner.has_class("-folded")
-
-        # operations pause the animation, then resume
-        app._set_banner_paused(True)
-        frozen = banner._phase
-        banner._tick()
-        assert banner._phase == frozen  # paused -> no advance
-        app._set_banner_paused(False)
-        banner._tick()
-        assert banner._phase != frozen
+        header = app.query_one(WorkbenchHeader)
+        assert header.size.height == 1
+        assert app.title == "Aitomation"
 
 
 # -- Usage tab: cost model + meters + collapsible runs ----------------------------------

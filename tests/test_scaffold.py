@@ -175,25 +175,37 @@ def _compiles(path) -> None:
 
 def test_scaffold_api_project(tmp_path):
     dest = scaffold_project(_api_inventory(), tmp_path / "e2e")
-    for name in ("conftest.py", "api_client.py", "tests/test_smoke.py", "reporting.py", "pages.py"):
+    for name in (
+        "conftest.py",
+        "api/__init__.py",
+        "api/client.py",
+        "tests/test_smoke.py",
+        "support/__init__.py",
+        "support/reporting.py",
+    ):
         _compiles(dest / name)
+    # API-only system: no pages package, no legacy monoliths
+    assert not (dest / "pages").exists()
+    assert not (dest / "pages.py").exists() and not (dest / "api_client.py").exists()
 
     assert (dest / "pyproject.toml").exists()
     assert (dest / "Dockerfile").exists()
     assert (dest / ".github/workflows/e2e.yml").exists()
     assert (dest / ".env.example").exists()
-    # pro pytest defaults: trace/screenshot on failure + registered markers
+    # pro pytest defaults: trace/screenshot on failure + registered markers + importable root
     pyproject = (dest / "pyproject.toml").read_text()
     assert "--tracing=retain-on-failure" in pyproject and "markers" in pyproject
+    assert 'pythonpath = ["."]' in pyproject
 
     conftest = (dest / "conftest.py").read_text()
     assert "Bearer" in conftest and "AUTH_TOKEN" in conftest
     # base_url normalised with a trailing slash so relative request paths resolve correctly
     assert 'rstrip("/") + "/"' in conftest
 
-    client = (dest / "api_client.py").read_text()
+    client = (dest / "api" / "client.py").read_text()
     assert "def create_thing(" in client and "def get_thing(" in client
     assert 'self.request.post("things"' in client  # relative path (no leading slash)
+    assert "from .client import ApiClient" in (dest / "api" / "__init__.py").read_text()
 
     smoke = (dest / "tests/test_smoke.py").read_text()
     assert 'api_request_context.get("things")' in smoke
@@ -202,16 +214,31 @@ def test_scaffold_api_project(tmp_path):
 
 def test_scaffold_web_project(tmp_path):
     dest = scaffold_project(_web_inventory(), tmp_path / "e2e")
-    for name in ("conftest.py", "pages.py", "tests/test_smoke.py"):
+    for name in (
+        "conftest.py",
+        "pages/__init__.py",
+        "pages/base_page.py",
+        "pages/home_page.py",
+        "pages/login_form_page.py",
+        "tests/test_smoke.py",
+    ):
         _compiles(dest / name)
+    # browser-only system: no api package, no legacy monolith
+    assert not (dest / "api").exists() and not (dest / "pages.py").exists()
 
-    pages = (dest / "pages.py").read_text()
-    assert "class HomePage:" in pages and "class LoginFormPage:" in pages
+    # one module per page object, inheriting the shared BasePage
+    assert "class HomePage(BasePage):" in (dest / "pages" / "home_page.py").read_text()
+    login_page = (dest / "pages" / "login_form_page.py").read_text()
+    assert "class LoginFormPage(BasePage):" in login_page
     # form fields seeded as role/label locators (POM isn't empty)
-    assert 'self.username = page.get_by_label("username")' in pages
-    assert "def fill(self, **values: str)" in pages
+    assert 'self.username = page.get_by_label("username")' in login_page
+    assert "def fill(self, **values: str)" in login_page
+    # the package root re-exports every page so `from pages import X` works
+    init = (dest / "pages" / "__init__.py").read_text()
+    assert "from .home_page import HomePage" in init
+    assert "from .login_form_page import LoginFormPage" in init
     # Page Objects must not be collected by pytest (e.g. a "Test…"-named page)
-    assert "__test__ = False" in pages
+    assert "__test__ = False" in (dest / "pages" / "base_page.py").read_text()
 
     conftest = (dest / "conftest.py").read_text()
     # session auth uses storage_state (log in once, reuse) — the Playwright best practice
@@ -246,10 +273,10 @@ def test_page_object_uses_observed_locator_and_first(tmp_path):
         ],
     )
     dest = scaffold_project(inv, tmp_path / "e2e")
-    pages = (dest / "pages.py").read_text()
-    _compiles(dest / "pages.py")
+    page_module = dest / "pages" / "login_form_page.py"
+    _compiles(page_module)
     # uses the observed locator, with .first because it wasn't unique on the page
-    assert 'self.email = page.get_by_placeholder("Email Address").first' in pages
+    assert 'self.email = page.get_by_placeholder("Email Address").first' in page_module.read_text()
 
 
 def test_base_url_trailing_slash_is_normalized():
@@ -263,9 +290,40 @@ def test_scaffold_is_deterministic(tmp_path):
     inv = _api_inventory()
     a = scaffold_project(inv, tmp_path / "a")
     b = scaffold_project(inv, tmp_path / "b")
-    fa = (a / "api_client.py").read_text()
-    fb = (b / "api_client.py").read_text()
+    fa = (a / "api" / "client.py").read_text()
+    fb = (b / "api" / "client.py").read_text()
     assert fa == fb
+
+
+def test_rescaffold_upgrades_legacy_layout_in_place(tmp_path):
+    """A re-scaffold over a pre-package-layout run replaces OUR old monoliths with the
+    packages — but never deletes a colliding file the user wrote themselves."""
+    inv = _web_inventory()
+    dest = tmp_path / "e2e"
+    dest.mkdir()
+    (dest / "pages.py").write_text(
+        '"""Page objects... Generated by Aitomation Scaffold."""\n', encoding="utf-8"
+    )
+    (dest / "api_client.py").write_text('"""Mine, hand-written."""\n', encoding="utf-8")
+    scaffold_project(inv, dest)
+    assert not (dest / "pages.py").exists()  # ours → upgraded away
+    assert (dest / "api_client.py").exists()  # not ours → untouched
+    assert (dest / "pages" / "__init__.py").exists()
+
+
+def test_rescaffold_drops_stale_page_modules(tmp_path):
+    """A page that disappears from the inventory disappears from pages/ on re-scaffold;
+    a hand-written module survives."""
+    inv = _web_inventory()
+    dest = scaffold_project(inv, tmp_path / "e2e")
+    hand = dest / "pages" / "my_helpers.py"
+    hand.write_text("HELPERS = True\n", encoding="utf-8")
+    inv.elements = [e for e in inv.elements if e.name != "Home"]
+    scaffold_project(inv, dest)
+    assert not (dest / "pages" / "home_page.py").exists()
+    assert (dest / "pages" / "login_form_page.py").exists()
+    assert hand.exists()
+    assert "home_page" not in (dest / "pages" / "__init__.py").read_text()
 
 
 # --- backend surfaces (events + databases) -----------------------------------------------

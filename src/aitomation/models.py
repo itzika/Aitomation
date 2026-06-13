@@ -130,6 +130,12 @@ class AuthScheme(BaseModel):
 class CoverageInventory(BaseModel):
     """The system model. Produced by Discover, consumed by Scaffold and Write."""
 
+    # Versioned so saved inventories survive schema evolution: the diff/baseline story
+    # depends on a years-old inventory.json still loading. Set deterministically (never by
+    # the model); bump ONLY on a breaking shape change, with a loader shim for old values.
+    schema_version: int = Field(
+        default=1, description="CoverageInventory schema version. Set by the toolkit."
+    )
     system_name: str = Field(description="Human name of the system under test.")
     base_url: str = Field(description="Base URL or server the system is reached at.")
     source: DiscoverySource = Field(description="How this inventory was discovered.")

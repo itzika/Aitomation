@@ -2,8 +2,10 @@
 
 One LLM call per selected journey, each grounded in only the elements that journey touches
 so drafts reference real paths/fields. Output is validated as a Pydantic `TestDraft`, then
-syntax-checked: clean drafts land in `tests/`, anything that won't parse is quarantined to
-`drafts_needs_review/` so it can't break `pytest` collection.
+syntax-checked: clean drafts land under `tests/` — routed into `tests/web/`, `tests/api/`,
+or `tests/contract/` by the surface they exercise (flat `tests/` on a pre-package-layout
+scaffold) — and anything that won't parse is quarantined to `drafts_needs_review/` so it
+can't break `pytest` collection.
 """
 
 from __future__ import annotations
@@ -833,13 +835,32 @@ async def _verify_and_heal(
     return draft, body, header, rc != 0
 
 
+def _draft_subdir(*, web: bool, api: bool, event: bool, data: bool) -> str:
+    """Which tests/ subdirectory a draft belongs in, by the surfaces it exercises. A mixed
+    journey that drives a browser is a web test; pure API journeys are API tests; EVENT/DATA
+    contract checks get their own home. Mirrors `journey_type`'s default of API."""
+    if web:
+        return "web"
+    if api:
+        return "api"
+    if event or data:
+        return "contract"
+    return "api"
+
+
+def _structured_layout(into: Path) -> bool:
+    """True for the package-layout scaffold (pages/, api/, support/, routed tests/). Older
+    flat scaffolds keep their flat tests/ so a re-run never splits an existing suite."""
+    return (into / "support").is_dir()
+
+
 def _existing_flow_keys(tests_dir: Path) -> dict[str, Path]:
     """Map each already-drafted flow fingerprint (the `# Flow:` header stamp) to its file, so
     a flow the LLM merely renamed isn't re-drafted as a duplicate on the next discover."""
     out: dict[str, Path] = {}
     if not tests_dir.is_dir():
         return out
-    for p in sorted(tests_dir.glob("test_*.py")):
+    for p in sorted(tests_dir.rglob("test_*.py")):
         try:
             head = p.read_text(encoding="utf-8").splitlines()[:8]
         except OSError:
@@ -869,9 +890,14 @@ async def draft_tests(
     verify: bool = False,
     force: bool = False,
     on_draft: Callable[[WriteResult], None] | None = None,
+    concurrency: int = 4,
 ) -> WriteReport:
     """Draft one test per selected journey into `into`/tests. Returns a report of what was
     written / quarantined / skipped. `on_draft` is called after each draft (progress).
+
+    Journeys are drafted CONCURRENTLY (bounded by `concurrency`) — each draft is an
+    independent LLM call — while `--verify` pytest runs stay serialized (they share the
+    scaffold's venv and state). The report keeps priority order regardless of completion.
 
     Non-destructive by default: a journey whose test file already exists is SKIPPED (no LLM
     call, no overwrite) so re-running over an evolved system only drafts the new flows and
@@ -880,13 +906,20 @@ async def draft_tests(
     tests_dir = into / "tests"
     tests_dir.mkdir(parents=True, exist_ok=True)
     review_dir = into / "drafts_needs_review"
+    structured = _structured_layout(into)
 
     report = WriteReport()
-    used: set[str] = set()
+    # Seed with every test stem already anywhere under tests/ — subdirectories share one
+    # pytest module namespace (no __init__.py), so stems must be unique across the tree.
+    used: set[str] = {p.stem for p in tests_dir.rglob("test_*.py")}
     # Flows already on disk, keyed by stable fingerprint — so a renamed-but-identical flow
     # is recognised and skipped rather than re-drafted under a new filename.
     existing_flows = {} if force else _existing_flow_keys(tests_dir)
+    existing_names = {} if force else {p.name: p for p in tests_dir.rglob("test_*.py")}
 
+    # Pre-pass (sequential, no LLM): resolve skips and allocate unique stems + target dirs
+    # up front, so the concurrent generation phase never contends on naming or directories.
+    jobs: list[tuple[Journey, bool, bool, bool, bool, bool, str, Path]] = []
     for journey in select_journeys(inv, max_journeys):
         destructive = is_destructive(inv, journey)
         els = _elements_for(inv, journey)
@@ -895,14 +928,14 @@ async def draft_tests(
         event = any(e.kind in ("topic", "event_schema") for e in els)
         data = any(e.kind in ("table", "migration") for e in els)
         # Compute the test name first so usage is attributed per test ("write:<test>").
-        stem = _unique(f"test_{_func_name(journey.name)}", used)
-        test_path = tests_dir / f"{stem}.py"
+        natural = f"test_{_func_name(journey.name)}"
         if not force:
             # Skip a flow that's already drafted — matched by its STABLE fingerprint (so a
-            # rename doesn't fool us) or by an exact filename (covers pre-fingerprint files).
-            # Keeps re-discovery incremental and never clobbers a reviewed test.
-            existing = existing_flows.get(journey_fingerprint(inv, journey)) or (
-                test_path if test_path.exists() else None
+            # rename doesn't fool us) or by an exact filename anywhere under tests/ (covers
+            # pre-fingerprint files). Keeps re-discovery incremental and never clobbers a
+            # reviewed test.
+            existing = existing_flows.get(journey_fingerprint(inv, journey)) or existing_names.get(
+                f"{natural}.py"
             )
             if existing is not None:
                 result = WriteResult(journey.name, existing, "existing", False, destructive)
@@ -910,83 +943,119 @@ async def draft_tests(
                 if on_draft is not None:
                     on_draft(result)
                 continue
-        prompt = build_prompt(inv, journey, destructive=destructive)
-
-        system_prompt = _SYSTEM_PROMPT
-        draft = await provider.generate_structured(
-            prompt, TestDraft, system=system_prompt, label=f"write:{stem}"
+        stem = _unique(natural, used)
+        # Route the draft by the surface it exercises (web/api/contract) on the package
+        # layout; older flat scaffolds keep a flat tests/.
+        target_dir = (
+            tests_dir / _draft_subdir(web=web, api=api, event=event, data=data)
+            if structured
+            else tests_dir
         )
-        findings = lint_draft(draft.code, web=web, api=api, event=event, data=data)
-        if findings:
-            # one corrective retry with the specific violations fed back to the model
+        target_dir.mkdir(parents=True, exist_ok=True)
+        jobs.append((journey, destructive, web, api, event, data, stem, target_dir))
+
+    # Generation fans out (each journey's draft is independent), but verify/heal runs are
+    # SERIALIZED: they share the scaffold's venv, .auth/ state and test-results/, and `uv run`
+    # may sync the environment — two pytest processes in one scaffold would race.
+    sem = asyncio.Semaphore(max(1, concurrency))
+    verify_lock = asyncio.Lock()
+
+    async def _draft_one(
+        journey: Journey,
+        destructive: bool,
+        web: bool,
+        api: bool,
+        event: bool,
+        data: bool,
+        stem: str,
+        target_dir: Path,
+    ) -> tuple[WriteResult, bool]:
+        async with sem:
+            prompt = build_prompt(inv, journey, destructive=destructive)
+            system_prompt = _SYSTEM_PROMPT
             draft = await provider.generate_structured(
-                prompt + _corrective(findings),
-                TestDraft,
-                system=system_prompt,
-                label=f"write:{stem}",
+                prompt, TestDraft, system=system_prompt, label=f"write:{stem}"
             )
             findings = lint_draft(draft.code, web=web, api=api, event=event, data=data)
-
-        # Backend contract drafts are read-only by construction; if the model nonetheless
-        # emitted real mutation (DML/commit or a broker publish), guard it like any
-        # destructive flow. Judged from the generated CODE, not the journey prose.
-        if not destructive and (event or data) and _mutates_backend(draft.code):
-            destructive = True
-        # API draft that issues an HTTP write not tied to a referenced mutating element (e.g.
-        # an invented cleanup DELETE on a read-only journey) — the inventory-level check only
-        # sees named elements, so guard it from the generated code as the backstop.
-        if not destructive and api and _http_mutates(draft.code):
-            destructive = True
-
-        # Inject the skip guard deterministically — never rely on the model to add it.
-        guard = _SKIP_BLOCK if destructive else ""
-        body = guard + draft.code.strip() + "\n"
-        header = _header(inv, journey, draft, destructive)
-        compiles = _compiles(header + body, f"{stem}.py")
-
-        if compiles and not findings:
-            path = tests_dir / f"{stem}.py"
-            path.write_text(header + body, encoding="utf-8")
-
-            runtime_failed = False
-            if verify and not destructive:
-                # Self-heal keeps the draft clean & runnable; it never re-quarantines.
-                draft, body, header, runtime_failed = await _verify_and_heal(
-                    inv,
-                    journey,
-                    provider,
-                    draft=draft,
-                    body=body,
-                    header=header,
-                    prompt=prompt,
-                    system_prompt=system_prompt,
-                    stem=stem,
-                    path=path,
-                    into=into,
-                    web=web,
-                    api=api,
-                    event=event,
-                    data=data,
+            if findings:
+                # one corrective retry with the specific violations fed back to the model
+                draft = await provider.generate_structured(
+                    prompt + _corrective(findings),
+                    TestDraft,
+                    system=system_prompt,
+                    label=f"write:{stem}",
                 )
+                findings = lint_draft(draft.code, web=web, api=api, event=event, data=data)
 
-            result = WriteResult(
-                journey.name, path, draft.confidence, False, destructive, runtime_failed
+            # Post-generation safety net, judged from the generated CODE (not journey prose):
+            # a backend contract draft that nonetheless emits real mutation (DML/commit or a
+            # broker publish), or an API draft issuing an HTTP write not tied to a referenced
+            # mutating element (e.g. an invented cleanup DELETE on a read-only journey), gets
+            # guarded like any destructive flow.
+            destructive_now = destructive or bool(
+                ((event or data) and _mutates_backend(draft.code))
+                or (api and _http_mutates(draft.code))
             )
-            report.written.append(result)
-        else:
-            # Enforce-or-quarantine: keep non-conforming drafts out of the runnable suite.
-            review_dir.mkdir(parents=True, exist_ok=True)
-            reasons = list(findings) + ([] if compiles else ["module does not parse"])
-            notes = (
-                "# LINT — fix before enabling:\n" + "".join(f"#   - {r}\n" for r in reasons) + "\n"
-            )
-            path_txt = review_dir / f"{stem}.py.txt"
-            path_txt.write_text(header + notes + body, encoding="utf-8")
-            result = WriteResult(journey.name, path_txt, draft.confidence, True, destructive)
-            report.quarantined.append(result)
 
-        if on_draft is not None:
-            on_draft(result)
+            # Inject the skip guard deterministically — never rely on the model to add it.
+            guard = _SKIP_BLOCK if destructive_now else ""
+            body = guard + draft.code.strip() + "\n"
+            header = _header(inv, journey, draft, destructive_now)
+            compiles = _compiles(header + body, f"{stem}.py")
+
+            if compiles and not findings:
+                path = target_dir / f"{stem}.py"
+                path.write_text(header + body, encoding="utf-8")
+
+                runtime_failed = False
+                if verify and not destructive_now:
+                    # Self-heal keeps the draft clean & runnable; it never re-quarantines.
+                    async with verify_lock:
+                        draft, body, header, runtime_failed = await _verify_and_heal(
+                            inv,
+                            journey,
+                            provider,
+                            draft=draft,
+                            body=body,
+                            header=header,
+                            prompt=prompt,
+                            system_prompt=system_prompt,
+                            stem=stem,
+                            path=path,
+                            into=into,
+                            web=web,
+                            api=api,
+                            event=event,
+                            data=data,
+                        )
+
+                result = WriteResult(
+                    journey.name, path, draft.confidence, False, destructive_now, runtime_failed
+                )
+                quarantined = False
+            else:
+                # Enforce-or-quarantine: keep non-conforming drafts out of the runnable suite.
+                review_dir.mkdir(parents=True, exist_ok=True)
+                reasons = list(findings) + ([] if compiles else ["module does not parse"])
+                notes = (
+                    "# LINT — fix before enabling:\n"
+                    + "".join(f"#   - {r}\n" for r in reasons)
+                    + "\n"
+                )
+                path_txt = review_dir / f"{stem}.py.txt"
+                path_txt.write_text(header + notes + body, encoding="utf-8")
+                result = WriteResult(
+                    journey.name, path_txt, draft.confidence, True, destructive_now
+                )
+                quarantined = True
+
+            if on_draft is not None:
+                on_draft(result)
+            return result, quarantined
+
+    # gather preserves job (priority) order in the report even though completion interleaves.
+    for result, quarantined in await asyncio.gather(*(_draft_one(*job) for job in jobs)):
+        (report.quarantined if quarantined else report.written).append(result)
 
     return report
 
@@ -1205,7 +1274,7 @@ async def heal_failing_tests(
     by_flow = {journey_fingerprint(inv, j): j for j in journeys}
     by_stem = {f"test_{_func_name(j.name)}": j for j in journeys}
 
-    for path in sorted(tests_dir.glob("test_*.py")):
+    for path in sorted(tests_dir.rglob("test_*.py")):
         src = path.read_text(encoding="utf-8")
         if "mark.skip" in src:
             continue  # destructive / explicitly skipped — not meant to run unattended
@@ -1341,12 +1410,13 @@ def enable_draft_source(src: str) -> tuple[str, bool]:
 
 
 def find_skipped_drafts(into: Path | str) -> list[Path]:
-    """Drafted test files under `into`/tests that still carry the injected skip guard."""
+    """Drafted test files under `into`/tests (any depth) that still carry the injected skip
+    guard."""
     tests_dir = Path(into) / "tests"
     if not tests_dir.is_dir():
         return []
     out: list[Path] = []
-    for p in sorted(tests_dir.glob("test_*.py")):
+    for p in sorted(tests_dir.rglob("test_*.py")):
         try:
             if is_skip_guarded(p.read_text(encoding="utf-8")):
                 out.append(p)
@@ -1356,11 +1426,12 @@ def find_skipped_drafts(into: Path | str) -> list[Path]:
 
 
 def _resolve_target(tests_dir: Path, target: str) -> Path | None:
-    """Resolve a user-supplied test name to a file. Accepts 'foo', 'test_foo', or
-    'test_foo.py' (with or without the test_ prefix / .py suffix)."""
+    """Resolve a user-supplied test name to a file anywhere under tests/. Accepts 'foo',
+    'test_foo', or 'test_foo.py' (with or without the test_ prefix / .py suffix)."""
     stem = target[:-3] if target.endswith(".py") else target
-    for cand in (tests_dir / f"{stem}.py", tests_dir / f"test_{stem}.py"):
-        if cand.is_file():
+    names = {f"{stem}.py", f"test_{stem}.py"}
+    for cand in sorted(tests_dir.rglob("*.py")):
+        if cand.name in names:
             return cand
     return None
 

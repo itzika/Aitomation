@@ -7,8 +7,7 @@ workspace, exports each screen to SVG, then rasterises to PNG with `rsvg-convert
     uv run python scripts/screenshots.py
 
 PNGs (referenced by README.md) land in docs/img/. Re-run after a UI change to refresh
-them. The matrix-rain banner is animated, so each capture freezes a different frame —
-that's expected.
+them.
 """
 
 from __future__ import annotations

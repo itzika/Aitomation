@@ -198,11 +198,24 @@ def _print_diff(d: InventoryDiff) -> None:
         )
 
 
+def _setup_status(msg: str) -> None:
+    # One-off environment-setup notices from a discovery backend (e.g. the first-run
+    # Chromium download) — printed so the spinner's silence doesn't read as a hang.
+    console.print(f"[yellow]![/] {msg}")
+
+
+def _run_discovery(coro) -> CoverageInventory:
+    """Await a discovery coroutine behind a spinner — a model call can take a minute, and
+    silence reads as a hang."""
+    with console.status("[bold cyan]discovering[/] — extracting the surface, then one model call…"):
+        return asyncio.run(coro)
+
+
 def _finish(coro, out: Path, *, origin: str | None = None) -> None:
     """Await a discovery coroutine, then write + print the inventory (shared epilogue)."""
     baseline = _try_load_inventory(out)
     try:
-        inventory: CoverageInventory = asyncio.run(coro)
+        inventory: CoverageInventory = _run_discovery(coro)
     except (FileNotFoundError, ValueError) as e:
         err.print(f"[bold red]Discovery failed:[/] {e}")
         raise typer.Exit(code=1) from None
@@ -350,7 +363,13 @@ def discover_crawl_cmd(
     recorder = UsageRecorder(app=url, log_path=usage_log)
     llm = _resolve_provider(provider, model, recorder)
     try:
-        _finish(discover_crawl(url, llm, max_pages=max_pages, max_depth=max_depth), out, origin=url)
+        _finish(
+            discover_crawl(
+                url, llm, max_pages=max_pages, max_depth=max_depth, on_status=_setup_status
+            ),
+            out,
+            origin=url,
+        )
     finally:
         _report_usage(recorder)
 
@@ -407,23 +426,58 @@ def write(
     console.print(f"[dim]Drafting tests for[/] [bold]{inv.system_name}[/] [dim]→[/] {into}/tests")
     recorder = UsageRecorder(app=inv.system_name, log_path=usage_log)
     llm = _resolve_provider(provider, model, recorder)
-    login = None
     try:
-        report = asyncio.run(
-            draft_tests(inv, llm, into=into, max_journeys=max_journeys, verify=verify, force=force)
+        report, login = _run_write(
+            inv, llm, into=into, max_journeys=max_journeys, verify=verify, force=force
         )
-        # Session-auth scaffold → author login.py from the discovered form (no-op otherwise).
-        # Best-effort: a failure here never fails the write.
-        try:
-            login = asyncio.run(draft_login(inv, llm, into=into, force=force))
-        except Exception as e:
-            err.print(f"[yellow]![/] login.py authoring skipped: {type(e).__name__}: {e}")
     except Exception as e:
         err.print(f"[bold red]Write failed:[/] {type(e).__name__}: {e}")
         raise typer.Exit(code=1) from None
     finally:
         _report_usage(recorder)
 
+    if managed:
+        # Record the draft in the shared index so the TUI library reflects it and re-runs
+        # target this same run. Upsert keeps the prior discover's origin/flags intact.
+        ws.save(inv)
+        ws.set_flags(slug, drafted=True, latest_run=str(into))
+
+    _print_write_report(report, login, verify=verify, into=into)
+
+
+def _run_write(inv, llm, *, into: Path, max_journeys: int, verify: bool, force: bool):
+    """Run draft_tests (+ best-effort login authoring) behind a per-draft progress spinner."""
+    with console.status("[bold cyan]drafting[/] …") as status:
+        done = 0
+
+        def _tick(res) -> None:
+            nonlocal done
+            done += 1
+            status.update(f"[bold cyan]drafting[/] {done} flow(s) done — last: {res.path.name}")
+
+        report = asyncio.run(
+            draft_tests(
+                inv,
+                llm,
+                into=into,
+                max_journeys=max_journeys,
+                verify=verify,
+                force=force,
+                on_draft=_tick,
+            )
+        )
+        # Session-auth scaffold → author login.py from the discovered form (no-op otherwise).
+        # Best-effort: a failure here never fails the write.
+        login = None
+        try:
+            login = asyncio.run(draft_login(inv, llm, into=into, force=force))
+        except Exception as e:
+            err.print(f"[yellow]![/] login.py authoring skipped: {type(e).__name__}: {e}")
+    return report, login
+
+
+def _print_write_report(report, login, *, verify: bool, into: Path) -> None:
+    """The human summary of a write run — shared by `write` and `go`."""
     if login is not None and login.authored:
         console.print(
             "\n[green]✓[/] Authored [bold]login.py[/] from the discovered sign-in form "
@@ -431,12 +485,6 @@ def write(
         )
     elif login is not None and login.reason and login.reason != "already authored":
         console.print(f"[yellow]![/] login.py kept as the scaffold stub [dim]({login.reason})[/].")
-
-    if managed:
-        # Record the draft in the shared index so the TUI library reflects it and re-runs
-        # target this same run. Upsert keeps the prior discover's origin/flags intact.
-        ws.save(inv)
-        ws.set_flags(slug, drafted=True, latest_run=str(into))
 
     if report.written:
         n_destructive = sum(1 for r in report.written if r.destructive)
@@ -773,6 +821,145 @@ def _fmt_counts(counts: dict[str, int]) -> str:
     if not counts:
         return "—"
     return ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+
+
+_DB_PREFIXES = ("postgresql://", "postgres://", "mysql://", "sqlite://", "mssql://", "oracle://")
+
+
+def _sniff_kind(source: str) -> str:
+    """Best-effort source-kind detection for `go`. Deterministic and cheap: DB URLs and .sql
+    by shape; specs by sniffing the document for its declared standard; an HTML response (or
+    an unreachable/odd URL) is treated as a web app to crawl. `--kind` overrides."""
+    s = source.lower()
+    if s.endswith(".sql") or s.startswith(_DB_PREFIXES):
+        return "db"
+    text: str | None = None
+    if s.startswith(("http://", "https://")):
+        try:
+            import httpx
+
+            resp = httpx.get(source, timeout=10, follow_redirects=True)
+            if "html" in resp.headers.get("content-type", ""):
+                return "crawl"
+            text = resp.text
+        except Exception:
+            return "crawl"
+    else:
+        p = Path(source)
+        if p.exists():
+            text = p.read_text(encoding="utf-8", errors="ignore")
+    head = (text or "")[:4000]
+    if '"asyncapi"' in head or "asyncapi:" in head:
+        return "asyncapi"
+    if any(tok in head for tok in ('"openapi"', "openapi:", '"swagger"', "swagger:")):
+        return "openapi"
+    return "crawl" if s.startswith(("http://", "https://")) else "openapi"
+
+
+@app.command()
+def go(
+    source: str = typer.Argument(
+        ...,
+        help="What to point at: an OpenAPI/AsyncAPI spec (URL or file), a running web app URL, "
+        "a DB connection URL / .sql file, or a schema registry URL (with --kind registry).",
+    ),
+    kind: str = typer.Option(
+        "auto",
+        "--kind",
+        "-k",
+        help="Source kind: auto | openapi | asyncapi | crawl | db | registry.",
+    ),
+    max_journeys: int = typer.Option(8, "--max", help="Max journeys to draft."),
+    verify: bool = typer.Option(
+        False, "--verify", help="Run drafted tests once and self-heal any failures."
+    ),
+    max_pages: int = typer.Option(25, "--max-pages", help="Crawl bound: maximum pages."),
+    max_depth: int = typer.Option(3, "--max-depth", help="Crawl bound: maximum link depth."),
+    provider: str | None = typer.Option(None, "--provider", "-p", help=_PROVIDER_HELP),
+    model: str | None = typer.Option(None, "--model", "-m", help="Override model name."),
+    usage_log: Path = typer.Option(
+        Path(DEFAULT_LOG),
+        "--usage-log",
+        envvar="AITOMATION_USAGE_LOG",
+        help="JSONL usage log path.",
+    ),
+) -> None:
+    """The whole pipeline in one command: discover → scaffold → draft tests."""
+    k = kind.lower() if kind != "auto" else _sniff_kind(source)
+    if k not in ("openapi", "asyncapi", "crawl", "db", "registry"):
+        err.print(f"[bold red]Unknown --kind[/] {kind!r} (openapi/asyncapi/crawl/db/registry).")
+        raise typer.Exit(code=2)
+    auto_note = " [dim](auto-detected — override with --kind)[/]" if kind == "auto" else ""
+    console.print(f"[dim]Source kind:[/] [bold]{k}[/]{auto_note}")
+
+    recorder = UsageRecorder(app=source, log_path=usage_log)
+    llm = _resolve_provider(provider, model, recorder)
+    if k == "crawl":
+        coro = discover_crawl(
+            source, llm, max_pages=max_pages, max_depth=max_depth, on_status=_setup_status
+        )
+    else:
+        discoverer = {
+            "openapi": discover_openapi,
+            "asyncapi": discover_asyncapi,
+            "db": discover_db,
+            "registry": discover_registry,
+        }[k]
+        coro = discoverer(source, llm)
+
+    try:
+        inv = _run_discovery(coro)
+    except Exception as e:
+        _report_usage(recorder)
+        err.print(f"[bold red]Discovery failed:[/] {type(e).__name__}: {e}")
+        raise typer.Exit(code=1) from None
+
+    _print_inventory(inv)
+    ws = Workspace(PROJECTS_ROOT)
+    slug = slugify(inv.system_name)
+    ws.save(inv, origin=source)
+    run = ws.ensure_run(slug)
+    console.print(f"\n[green]✓[/] Discovered [dim](inventory in {PROJECTS_ROOT}/{slug}/.aito/)[/]")
+
+    try:
+        scaffold_project(inv, run, overwrite=True)
+    except Exception as e:
+        _report_usage(recorder)
+        err.print(f"[bold red]Scaffold failed:[/] {type(e).__name__}: {e}")
+        raise typer.Exit(code=1) from None
+    ws.set_flags(slug, scaffolded=True, latest_run=str(run))
+    console.print(f"[green]✓[/] Scaffolded [dim](deterministic, no LLM)[/] → [bold]{run}[/]")
+
+    try:
+        report, login = _run_write(
+            inv, llm, into=run, max_journeys=max_journeys, verify=verify, force=False
+        )
+    except Exception as e:
+        err.print(f"[bold red]Write failed:[/] {type(e).__name__}: {e}")
+        raise typer.Exit(code=1) from None
+    finally:
+        _report_usage(recorder)
+    ws.set_flags(slug, drafted=True)
+    _print_write_report(report, login, verify=verify, into=run)
+    console.print(
+        f"\nNext: [bold]cd {run} && uv sync && uv run playwright install chromium && uv run pytest[/]"
+    )
+
+
+@app.command()
+def schema() -> None:
+    """Print the CoverageInventory JSON Schema — the versioned contract of inventory files."""
+    import json
+
+    typer.echo(json.dumps(CoverageInventory.model_json_schema(), indent=2))
+
+
+# Help lists commands in WORKFLOW order, not file-definition order: the first thing a new
+# user reads should read as the pipeline. Sub-typers (discover, creds) always list after.
+_HELP_ORDER = ["tui", "go", "scaffold", "write", "enable", "schema", "usage", "version"]
+app.registered_commands.sort(
+    key=lambda c: _HELP_ORDER.index(c.name or c.callback.__name__)  # type: ignore[union-attr]
+)
 
 
 def main() -> None:

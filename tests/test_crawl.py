@@ -212,3 +212,70 @@ async def test_crawl_site_discovers_pages_forms_and_links(site, chromium_ready):
 async def test_crawl_respects_max_pages(site, chromium_ready):
     result = await crawl_site(site, max_pages=1, max_depth=3)
     assert len(result.pages) == 1
+
+
+# -- first-run self-heal: browser binaries missing ----------------------------------------
+
+
+class _FakeChromium:
+    def __init__(self, failures: list[Exception]) -> None:
+        self.failures = failures
+        self.launches = 0
+
+    async def launch(self, **kwargs):
+        self.launches += 1
+        if self.failures:
+            raise self.failures.pop(0)
+        return "browser"
+
+
+class _FakePW:
+    def __init__(self, failures: list[Exception]) -> None:
+        self.chromium = _FakeChromium(failures)
+
+
+async def test_launch_installs_chromium_once_then_retries(monkeypatch):
+    from aitomation.discover import crawl as crawl_mod
+
+    installed = []
+    monkeypatch.setattr(crawl_mod, "_install_chromium", lambda: installed.append(True))
+    pw = _FakePW(
+        [
+            Exception(
+                'BrowserType.launch: Executable doesn\'t exist at /x — run "playwright install"'
+            )
+        ]
+    )
+    statuses: list[str] = []
+
+    browser = await crawl_mod._launch_chromium(pw, statuses.append)
+    assert browser == "browser"
+    assert installed == [True]  # auto-install ran exactly once
+    assert pw.chromium.launches == 2  # failed launch + retry
+    assert any("downloading" in s.lower() for s in statuses)  # announced, not a silent hang
+
+
+async def test_launch_reraises_non_setup_errors(monkeypatch):
+    from aitomation.discover import crawl as crawl_mod
+
+    monkeypatch.setattr(
+        crawl_mod, "_install_chromium", lambda: pytest.fail("must not install on unrelated errors")
+    )
+    pw = _FakePW([Exception("net::ERR_CONNECTION_REFUSED")])
+    with pytest.raises(Exception, match="CONNECTION_REFUSED"):
+        await crawl_mod._launch_chromium(pw, None)
+
+
+async def test_failed_install_raises_actionable_error(monkeypatch):
+    from aitomation.discover import crawl as crawl_mod
+
+    def _boom():
+        raise RuntimeError(
+            "Chromium auto-install failed: no network. Install it manually "
+            "with `uv run playwright install chromium`, then retry."
+        )
+
+    monkeypatch.setattr(crawl_mod, "_install_chromium", _boom)
+    pw = _FakePW([Exception("Executable doesn't exist at /x")])
+    with pytest.raises(RuntimeError, match="playwright install chromium"):
+        await crawl_mod._launch_chromium(pw, None)

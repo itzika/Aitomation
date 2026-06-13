@@ -154,6 +154,58 @@ async def test_draft_tests_writes_compiling_files(tmp_path):
     compile(body, str(first.path), "exec")  # really runnable
 
 
+async def test_draft_tests_routes_by_surface_on_structured_scaffold(tmp_path):
+    """On the package-layout scaffold (marked by support/) drafts land in tests/<surface>/;
+    a journey touching web pages routes to web, a pure API one to api."""
+    (tmp_path / "support").mkdir()
+    inv = _inv()
+    inv.elements.append(
+        Element(kind="page", name="Home", location="/", description="home", priority="high")
+    )
+    inv.suggested_journeys = [
+        Journey(
+            name="Browse home",
+            description="web",
+            priority="high",
+            steps=[JourneyStep(action="open")],
+            elements=["Home"],
+        ),
+        Journey(
+            name="List things",
+            description="api",
+            priority="medium",
+            steps=[JourneyStep(action="list")],
+            elements=["list_things"],
+        ),
+    ]
+    web_code = (
+        "from pages import HomePage\nfrom playwright.sync_api import expect\n"
+        "def test_w(page):\n    expect(HomePage(page).goto().page.locator('h1')).to_be_visible()\n"
+    )
+    api_code = "def test_a(api_request_context):\n    assert True\n"
+    provider = _FakeProvider(codes=[web_code, api_code])
+    report = await draft_tests(inv, provider, into=tmp_path, max_journeys=2)
+
+    assert len(report.written) == 2 and not report.quarantined
+    by_journey = {r.journey: r.path for r in report.written}
+    assert by_journey["Browse home"].parent == tmp_path / "tests" / "web"
+    assert by_journey["List things"].parent == tmp_path / "tests" / "api"
+
+
+async def test_draft_tests_skips_existing_flow_in_subdirectory(tmp_path):
+    """Re-drafting on a structured scaffold finds existing flows recursively — a flow already
+    drafted under tests/api/ is not re-drafted (and not duplicated at the tests/ root)."""
+    (tmp_path / "support").mkdir()
+    provider = _FakeProvider()
+    r1 = await draft_tests(_inv(), provider, into=tmp_path, max_journeys=1)
+    assert r1.written and r1.written[0].path.parent.name == "api"
+    calls = len(provider.prompts)
+
+    r2 = await draft_tests(_inv(), provider, into=tmp_path, max_journeys=1)
+    assert not r2.written and len(r2.skipped) == 1
+    assert len(provider.prompts) == calls  # no new LLM call for the existing flow
+
+
 async def test_draft_tests_quarantines_unparseable(tmp_path):
     provider = _FakeProvider(code="def broken(:\n  oops")
     report = await draft_tests(_inv(), provider, into=tmp_path, max_journeys=1)

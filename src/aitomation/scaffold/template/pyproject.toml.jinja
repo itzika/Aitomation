@@ -21,6 +21,9 @@ dependencies = [
 # test-results/. View a trace with:  uv run playwright show-trace test-results/<...>.zip
 addopts = "-ra --tracing=retain-on-failure --screenshot=only-on-failure --output=test-results"
 testpaths = ["tests"]
+# The project root stays importable from tests in subdirectories (tests/web, tests/api),
+# so `from pages import ...` / `from api import ...` resolve without packaging tricks.
+pythonpath = ["."]
 markers = [
     "smoke: fast checks that the framework wiring and system are reachable",
     "flow: a drafted end-to-end flow test",

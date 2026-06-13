@@ -10,10 +10,6 @@ from playwright.sync_api import APIRequestContext
 class ApiClient:
     def __init__(self, request: APIRequestContext) -> None:
         self.request = request
-{% if not endpoints %}
-    # No API endpoints were discovered in this inventory (browser-only system).
-    pass
-{% endif %}
 {% for e in endpoints %}
 {% set m = e.method.lower() %}
     def {{ e.func_name }}(self, **kwargs):

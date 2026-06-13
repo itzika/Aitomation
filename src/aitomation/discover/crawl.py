@@ -10,6 +10,7 @@ slice; detecting login forms is in scope, automating login is not.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections import Counter
 from collections.abc import Callable
@@ -221,16 +222,73 @@ async def extract_page(page, depth: int) -> PageArtifact:  # page: playwright Pa
     return artifact
 
 
+# Playwright's error text when the browser binaries were never installed. The Python package
+# alone isn't enough to crawl — `playwright install chromium` downloads the actual browser.
+_BROWSER_MISSING_SIGNALS = ("executable doesn't exist", "playwright install")
+
+_INSTALL_HINT = "uv run playwright install chromium"
+
+
+def _browser_missing(e: Exception) -> bool:
+    msg = str(e).lower()
+    return any(s in msg for s in _BROWSER_MISSING_SIGNALS)
+
+
+def _install_chromium() -> None:
+    """Install Playwright's Chromium (blocking; run via to_thread). Raises an actionable
+    error if the install itself fails (offline, no disk, …)."""
+    import subprocess
+    import sys
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True,
+            text=True,
+            timeout=900,  # a browser download on a slow link; generous but bounded
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"Chromium auto-install failed ({type(e).__name__}: {e}). "
+            f"Install it manually with `{_INSTALL_HINT}`, then retry."
+        ) from None
+    if proc.returncode != 0:
+        tail = " | ".join((proc.stdout + proc.stderr).strip().splitlines()[-4:])
+        raise RuntimeError(
+            f"Chromium auto-install failed: {tail or 'no output'}. "
+            f"Install it manually with `{_INSTALL_HINT}`, then retry."
+        )
+
+
+async def _launch_chromium(pw, on_status: Callable[[str], None] | None):
+    """Launch headless Chromium, self-healing the one cold-start failure everyone hits:
+    browser binaries not installed yet. Detect it, install once (announcing via
+    `on_status` — it's a big one-time download), and retry. Anything else re-raises."""
+    try:
+        return await pw.chromium.launch(headless=True)
+    except Exception as e:
+        if not _browser_missing(e):
+            raise
+    if on_status is not None:
+        on_status("Chromium isn't installed yet — downloading it now (one-time, ~150 MB)…")
+    await asyncio.to_thread(_install_chromium)
+    if on_status is not None:
+        on_status("Chromium installed.")
+    return await pw.chromium.launch(headless=True)
+
+
 async def crawl_site(
     base_url: str,
     *,
     max_pages: int = MAX_PAGES,
     max_depth: int = MAX_DEPTH,
     on_page: Callable[[PageArtifact], None] | None = None,
+    on_status: Callable[[str], None] | None = None,
 ) -> CrawlResult:
     """Bounded, same-origin BFS crawl. Returns deterministic artifacts for the LLM.
 
-    `on_page`, if given, is called after each page is crawled (for live progress)."""
+    `on_page`, if given, is called after each page is crawled (for live progress);
+    `on_status` carries one-off setup messages (e.g. the first-run browser install)."""
     from playwright.async_api import async_playwright
 
     result = CrawlResult(base_url=base_url)
@@ -238,7 +296,7 @@ async def crawl_site(
     visited: set[str] = set()
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+        browser = await _launch_chromium(pw, on_status)
         context = await browser.new_context()
         page = await context.new_page()
         page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
@@ -412,10 +470,13 @@ async def discover_crawl(
     max_pages: int = MAX_PAGES,
     max_depth: int = MAX_DEPTH,
     on_page: Callable[[PageArtifact], None] | None = None,
+    on_status: Callable[[str], None] | None = None,
 ) -> CoverageInventory:
     """Live-crawl discovery: crawl -> enumerate elements (with real locators) deterministically
     -> LLM supplies judgement (priorities/auth/journeys) -> merged inventory."""
-    result = await crawl_site(base_url, max_pages=max_pages, max_depth=max_depth, on_page=on_page)
+    result = await crawl_site(
+        base_url, max_pages=max_pages, max_depth=max_depth, on_page=on_page, on_status=on_status
+    )
     if not any(p.error is None for p in result.pages):
         raise ValueError(f"Crawl of {base_url} yielded no usable pages.")
 

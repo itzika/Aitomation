@@ -1,5 +1,8 @@
 # SPEC.md — Discovery Toolkit Architecture
 
+> Reconciled 2026-06: v1 (the MLP and more) has SHIPPED. This now records the architecture
+> as built, and defines v2 scope so the scope guardrails in CLAUDE.md stay meaningful.
+
 ## Product in one line
 
 Point it at a system → get a structured coverage inventory, a runnable Playwright+pytest
@@ -10,109 +13,109 @@ framework, and first-draft tests. Model-agnostic, BYO-key, self-hostable.
 ```
 DISCOVER  →  SCAFFOLD  →  WRITE  →  DEPLOY
 (AI core)    (templating)  (AI)     (plumbing)
- ^^^ MLP focus ^^^         follow-on  later
+ shipped      shipped      shipped   later
 ```
 
-### 1. Discover  — the differentiated core
+### 1. Discover — the differentiated core (shipped)
 
-Input (one or more):
-- A running app URL (crawl via Playwright MCP using the accessibility tree, not pixels)
-- An OpenAPI / Swagger spec
-- A Postman collection
+Inputs (five backends, each a subcommand and a wizard source):
+- An **OpenAPI / Swagger** spec (URL or file)
+- An **AsyncAPI** spec (channels → topics, messages → schemas)
+- A **schema registry** (Confluent-compatible REST)
+- A **database** (live reflection or a `.sql` DDL file)
+- A **running web app** — a bounded, deterministic same-origin BFS crawl using Playwright
+  (Python) directly over the accessibility tree. NOT an agent driving a browser, and not
+  the Playwright MCP (early drafts said MCP; the deterministic crawl won for
+  reproducibility and testability).
 
-Process:
-- Crawl/parse the surface. For web: walk routes, detect forms, auth flows, key journeys,
-  interactive elements via the a11y tree. For APIs: enumerate endpoints, methods, schemas.
-- Feed the raw crawl artifacts to the LLM (via the provider abstraction) to produce a
-  **structured, validated coverage inventory** — NOT tests yet.
+Process — the three-layer discovery design, the architectural core:
+1. **Deterministic extraction**: the spec is parsed (or the site crawled) into a factual
+   surface. Every endpoint/page/form/topic/table becomes a `TestableElement`
+   deterministically — the model cannot invent or drop surface.
+2. **LLM judgement only**: one structured call ranks priorities, infers `auth_strategy`,
+   and proposes journeys over the *fixed* element list. It decides what matters, never
+   what exists.
+3. **Deterministic backfill**: ground-truth fields (base URL, names, source, auth schemes,
+   `schema_version`) are set by code, never trusted to the model.
 
-Output: `CoverageInventory` (Pydantic model). This is the central artifact everything
-else consumes. Rough shape:
+Output: a validated `CoverageInventory` (Pydantic; see `models.py` — the file carries a
+`schema_version`, and `aitomation schema` prints the JSON Schema contract). This is the
+system model everything downstream consumes, and the artifact that accumulates value:
+`diff.py` compares inventories across discovers so re-discovery is incremental.
 
-```python
-class TestableElement(BaseModel):
-    kind: Literal["page", "form", "flow", "endpoint", "auth"]
-    name: str
-    location: str            # URL or endpoint path
-    description: str
-    inputs: list[Input]      # fields, params, body schema
-    preconditions: list[str] # e.g. "requires authenticated session"
-    priority: Literal["high", "medium", "low"]
+### 2. Scaffold — deterministic templating, NOT AI (shipped)
 
-class CoverageInventory(BaseModel):
-    system_name: str
-    base_url: str
-    auth_strategy: str | None     # "oauth2" | "session" | "basic" | None
-    elements: list[TestableElement]
-    suggested_journeys: list[Journey]
+Copier + post-copy rendering emit a **professional framework layout**:
+
+```
+projects/<slug>/e2e/run-<stamp>/
+├── conftest.py            # fixtures: base_url + auth matched to the discovered scheme
+├── pages/                 # one module per page object over a shared BasePage;
+│   ├── base_page.py       #   __init__.py re-exports so `from pages import X` holds
+│   └── <page>.py
+├── api/                   # ApiClient seeded from discovered endpoints
+├── support/               # reporting hook interface (triage is a separate product)
+├── tests/                 # test_smoke.py; drafts route to web/ api/ contract/
+├── pyproject.toml         # uv-managed; pythonpath, markers, trace-on-failure defaults
+├── Dockerfile, .github/workflows/e2e.yml, .env.example
+└── login.py               # session auth only; authored by Write from the real form
 ```
 
-Why this is the moat: most AI test writers hallucinate because they have no system model.
-The inventory IS the system model. It also accumulates value — over time you can diff
-inventories across versions to detect surface changes (a future hook, not MLP).
+Auth fixture kinds: bearer, API key in its *actual* header/query, HTTP basic, or a
+session/login flow on the `storage_state` pattern. No LLM anywhere in this stage.
 
-### 2. Scaffold — deterministic templating (NOT AI)
+### 3. Write — AI-assisted, human-authoritative (shipped)
 
-From the inventory, generate a framework skeleton with Copier:
-- pytest + pytest-playwright structure
-- fixtures (incl. an auth fixture chosen from `inventory.auth_strategy`)
-- page-object structure seeded from discovered pages
-- config, `pyproject.toml` (uv-managed), Docker, CI workflow stub
-- a reporting hook (left as an interface — triage is a separate product)
-
-AI's only role here: pick sensible defaults from the inventory. The generation itself is
-deterministic templating so output is reproducible.
-
-### 3. Write — AI-assisted, human-authoritative (thin follow-on)
-
-For each high-priority journey/element in the inventory, generate a first-draft pytest-
-playwright test into the scaffold. Lands as files for review. Never auto-merged.
-The inventory context is what makes these good rather than generic.
+One draft per journey, grounded on only the elements that journey touches. Drafts are
+generated concurrently (bounded), lint-gated (page-object use, web-first `expect`, no hard
+sleeps, valid assertion methods), regenerated once on findings, quarantined to
+`drafts_needs_review/` if still non-conforming. Mutating journeys are skip-guarded
+deterministically (`aitomation enable` lifts the guard after review). `--verify` runs each
+draft once and self-heals failures (the TUI's `f`). Never auto-merged.
 
 ### 4. Deploy — later
 
-CI wiring, parallelization, results hook. Out of MLP scope. Noted for completeness.
+CI wiring, parallelization, results hook. Still out of scope (the scaffold ships a CI
+workflow stub; that's the line).
 
-## LLM provider abstraction
+## LLM provider abstraction (decided: Pydantic AI)
 
-Single internal interface:
+`LLMProvider` protocol with `generate` / `generate_structured`; one Pydantic AI-backed
+implementation normalizes Anthropic, OpenAI, DashScope (Qwen), and any OpenAI-compatible
+local server. Structured-output mode is configurable (tool / prompted / native) because
+local servers reject large tool-call payloads. Prompt caching is on for Anthropic; system
+prompts are single-variant so caches actually hit. Every call is recorded (tokens, cache,
+latency, per-stage model) — the Usage tab/command makes the model-agnostic thesis measurable.
 
-```python
-class LLMProvider(Protocol):
-    async def generate(self, prompt: str, *, system: str | None = None) -> str: ...
-    async def generate_structured[T](self, prompt: str, schema: type[T]) -> T: ...
-```
+## Front-ends
 
-- `generate_structured` is the critical one — discovery depends on reliable JSON matching
-  a Pydantic schema. Providers differ on JSON/tool-calling; the abstraction normalizes
-  this and validates with Pydantic regardless of backend.
-- Evaluate **Pydantic AI** (typed, structured-first, agnostic) vs **LiteLLM** (broadest
-  provider coverage incl. local) during scaffold. Lean Pydantic AI.
-- Adapters: Anthropic, OpenAI, OpenAI-compatible (covers Qwen/Ollama/vLLM in one).
-- Config-driven provider+model selection. BYO-key via env/config, never hardcoded.
+CLI-first (`discover`/`scaffold`/`write`/`enable`/`creds`/`usage`/`schema`, plus
+`aitomation go <source>` running the whole pipeline) and the Workbench TUI — both drive the
+same pipeline and share the `projects/<slug>/e2e/run-*` workspace.
 
-## MLP definition (build this, nothing more)
+## v2 scope (the next wedge, in priority order)
 
-A CLI that:
-1. Takes a URL or an OpenAPI spec.
-2. Produces a validated `CoverageInventory` (JSON + human-readable summary).
-3. Scaffolds a runnable pytest+playwright project from it via Copier.
-4. Generates 5–10 first-draft tests for high-priority journeys.
+1. **Authenticated crawling** — wire the existing creds store + authored `perform_login`
+   into the crawler (scripted, reviewable login → `storage_state` → crawl the authed
+   surface). Most real systems sit behind a login; this is the demo→product gap.
+2. **Large-spec chunking** — chunk the *judgement* call (extraction is already unbounded)
+   per resource group with a merge pass, so 500-endpoint enterprise specs work.
+3. **GraphQL introspection + Postman collections** — two deterministic discovery backends.
+4. **`diff` as a CI command** — discover `--against baseline`, exit codes + markdown
+   report; nightly drift detection in the generated workflow. The inventory as a living
+   artifact (this was deliberately deferred from v1).
+5. **`coverage` report card** — deterministic mapping of elements ↔ journeys ↔ drafts ↔
+   last run: "X% of high-priority surface has a passing test".
+6. **Static HTML report** (`aitomation report`) — a self-contained shareable artifact.
+   Static file yes; hosted dashboard NO (that's the deferred triage product).
+7. **MCP server mode** — expose discover/scaffold/write/diff as MCP tools.
+8. **Discovery eval harness** — golden inventories + deterministic scoring × recorded
+   cost: "which model discovers best per dollar", reproducible.
+9. **PyPI release** — `uvx aitomation`; trusted publishing workflow.
 
-Demo target: point it at a sample app, get back a skeleton you can `uv run pytest` on,
-with draft tests, in minutes instead of days. That demo sells itself.
-
-## Explicitly OUT of scope for v1
+## Explicitly OUT of scope (unchanged)
 
 Dashboard, RBAC, SaaS/multi-tenant, results DB, the triage/reporting-intelligence layer
-(separate product), inventory-diffing, visual regression. Resist all of it.
-
-## Suggested build order
-
-1. Provider abstraction + one adapter (Anthropic), prove `generate_structured`.
-2. OpenAPI-spec discovery path first (deterministic input, easiest to validate the
-   inventory schema) BEFORE the live-crawl path.
-3. Live-crawl discovery via Playwright MCP.
-4. Scaffold via Copier from the inventory.
-5. Write draft tests.
-6. Add OpenAI + OpenAI-compatible adapters once the pipeline works end-to-end.
+(separate product), visual regression, an agentic "AI explores your app" crawler (a
+bounded-interaction crawl may be researched in v3; determinism stays the differentiator).
+No further investment in backend surfaces (events/DB) until the web+API wedge converts.

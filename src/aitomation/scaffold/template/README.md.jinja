@@ -21,11 +21,13 @@ Auth is `{{ auth_strategy }}` — set the relevant env vars (see `conftest.py`).
 ## Layout
 
 - `conftest.py` — fixtures (base_url, auth{% if has_api %}, API request context{% endif %}{% if has_db %}, db_inspector{% endif %}{% if has_events %}, message_schema{% endif %})
-{% if has_browser %}- `pages.py` — page objects seeded from discovered pages
-{% endif %}{% if has_api %}- `api_client.py` — client seeded from discovered endpoints
+{% if has_browser %}- `pages/` — page objects, one module per discovered page (`base_page.py` is the shared parent;
+  import from the package root: `from pages import SomePage`)
+{% endif %}{% if has_api %}- `api/` — `ApiClient` seeded from discovered endpoints (`from api import ApiClient`)
 {% endif %}{% if has_events %}- `schemas.json` — discovered message payload JSON Schemas (used by `message_schema`)
-{% endif %}- `tests/` — smoke tests (draft journey tests come from the Write stage)
-- `reporting.py` — reporting hook interface (triage is a separate product)
+{% endif %}- `tests/` — `test_smoke.py` at the root; drafted journeys land in `tests/web/`, `tests/api/`,
+  and `tests/contract/` by the surface they exercise
+- `support/` — reporting hook interface (triage is a separate product) and shared helpers
 {% if has_db or has_events %}
 
 ## Backend contract tests
